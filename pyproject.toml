@@ -16,6 +16,11 @@ dependencies = [
     "anndata>=0.8.0",
     "matplotlib>=3.5.0",
     "seaborn>=0.11.0",
+	"numba>=0.55.0",      # For JIT compilation
+    "umap-learn>=0.5.0",  # For UMAP
+    "scikit-learn>=1.0.0", # For DBSCAN
+    "scipy>=1.7.0",       # For sparse matrices and stats
+    "tqdm>=4.60.0",       # For progress bars
 ]
 requires-python = ">=3.8"
 
