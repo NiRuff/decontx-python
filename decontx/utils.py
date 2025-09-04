@@ -75,55 +75,30 @@ def validate_inputs(adata: AnnData, z: Optional[str], batch_key: Optional[str]):
             warnings.warn(f"Small batches detected (< 10 cells): {small_batches}")
 
 
-def retrieveFeatureIndex(features, x, by="rownames", exactMatch=True, removeNA=False):
-    """Exact equivalent of R's retrieveFeatureIndex function"""
+def retrieve_feature_index_fast(features, search_space, exact_match=True):
+    """Fast feature matching for numpy arrays"""
+    n_features = len(features)
+    indices = np.full(n_features, -1, dtype=np.int64)
 
-    # Extract search vector
-    if by == "rownames":
-        if hasattr(x, 'var_names') and x.var_names is not None:
-            search = x.var_names.tolist()
-        elif hasattr(x, 'index'):
-            search = x.index.tolist()
-        else:
-            raise ValueError(
-                "'rownames' of 'x' are 'None'. Please set 'rownames' or change 'by' to search a different column in 'x'.")
+    if exact_match:
+        for i in range(n_features):
+            matches = np.where(search_space == features[i])[0]
+            if len(matches) > 0:
+                indices[i] = matches[0]
     else:
-        if hasattr(x, 'var') and by in x.var.columns:
-            search = x.var[by].tolist()
-        elif hasattr(x, 'columns') and by in x.columns:
-            search = x[by].tolist()
-        else:
-            raise ValueError(f"'{by}' is not a column in 'x'.")
+        # Partial matching
+        for i in range(n_features):
+            feature = str(features[i])
+            matches = []
+            for j, item in enumerate(search_space):
+                if feature in str(item):
+                    matches.append(j)
+            if len(matches) == 1:
+                indices[i] = matches[0]
+            elif len(matches) > 1:
+                indices[i] = matches[0]  # Take first match
 
-    # Convert to numpy arrays for fast processing
-    features_arr = np.array(features, dtype=str)
-    search_arr = np.array(search, dtype=str)
-
-    # Use fast function
-    indices = retrieve_feature_index_fast(features_arr, search_arr, exactMatch)
-
-    # Convert -1 to NaN
-    indices_float = indices.astype(float)
-    indices_float[indices == -1] = np.nan
-
-    # Check for missing features
-    missing_mask = np.isnan(indices_float)
-    if np.any(missing_mask):
-        missing_features = features_arr[missing_mask]
-        if np.all(missing_mask):
-            if exactMatch:
-                raise ValueError(
-                    f"None of the provided features had matching items in '{by}' within 'x'. Check the spelling or try setting 'exactMatch = False'.")
-            else:
-                raise ValueError(
-                    f"None of the provided features had matching items in '{by}' within 'x'. Check the spelling and make sure 'by' is set to the appropriate place in 'x'.")
-
-        print(f"Warning: The following features were not present in 'x': {', '.join(missing_features)}")
-
-    if removeNA:
-        indices_float = indices_float[~missing_mask]
-
-    return indices_float
+    return indices
 
 
 def checkCountsDecon(counts):

@@ -210,8 +210,10 @@ class DecontXModel:
         n_cells, n_genes = X_dense.shape
         n_clusters = len(np.unique(z))
 
-        # Initialize theta exactly like R: rbeta(n=nC, shape1=delta[1], shape2=delta[2])
-        # CRITICAL: R uses delta in reverse order for rbeta!
+        from scipy.stats import beta
+
+        # R initializes theta as the proportion of NATIVE counts
+        # So if delta = [10, 10], theta ~ Beta(10, 10) which centers around 0.5
         theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.seed)
 
         # Initialize phi and eta exactly like R
