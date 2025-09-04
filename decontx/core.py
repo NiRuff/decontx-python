@@ -3,7 +3,7 @@ Core DecontX functionality with complete feature parity to R version.
 """
 
 import pandas as pd
-from typing import Optional, Union, Tuple, List, Dict, np.ndarray
+from typing import Optional, Union, Tuple, List, Dict
 import scanpy as sc
 from anndata import AnnData
 from tqdm import tqdm

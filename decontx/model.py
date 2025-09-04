@@ -295,7 +295,7 @@ class DecontXModel:
 
         return {
             'contamination': contamination,
-            'decontaminated': decontaminated,
+            'decontaminated_counts': decontaminated,
             'theta': theta,
             'phi': phi,
             'eta': eta,
