@@ -12,7 +12,7 @@ from sklearn.cluster import DBSCAN
 def initialize_clusters(
         adata: AnnData,
         var_genes: int = 5000,
-        random_state: int = 12345
+        seed: int = 12345
 ) -> np.ndarray:
     """
     Initialize cell clusters using UMAP + DBSCAN approach.
@@ -31,12 +31,12 @@ def initialize_clusters(
     sc.pp.log1p(adata_temp)
 
     # PCA and UMAP
-    sc.pp.pca(adata_temp, random_state=random_state)
-    sc.pp.neighbors(adata_temp, random_state=random_state)
-    sc.tl.umap(adata_temp, random_state=random_state)
+    sc.pp.pca(adata_temp, random_state=seed)
+    sc.pp.neighbors(adata_temp, random_state=seed)
+    sc.tl.umap(adata_temp, random_state=seed)
 
     # Clustering
-    sc.tl.leiden(adata_temp, random_state=random_state)
+    sc.tl.leiden(adata_temp, random_state=seed)
 
     return adata_temp.obs['leiden'].astype(int).values
 

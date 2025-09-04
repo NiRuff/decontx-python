@@ -70,18 +70,18 @@ def decontx(
     log("-" * 50)
 
     #  input validation
-    validate_inputs(adata, z, batch_key)
+    validate_inputs(adata, z, batch)
 
     # Process background with exact R logic
     background_dict = {}
     if background is not None:
         background_dict = _process_background(
-            adata, background, batch_key, bg_batch_key, log
+            adata, background, batch, bg_batch, log
         )
 
     #  cluster processing with exact R initialization
     z_labels, umap_coords = _process_clusters(
-        adata, z, var_genes, dbscan_eps, random_state, log
+        adata, z, var_genes, dbscan_eps, seed, log
     )
 
     # Store original data info for metadata
@@ -93,22 +93,22 @@ def decontx(
     log(f".. Processing {total_cells} cells and {total_genes} genes")
 
     # Process batches with  logic
-    if batch_key is not None:
-        batch_labels = adata.obs[batch_key].values
+    if batch is not None:
+        batch_labels = adata.obs[batch].values
         unique_batches = np.unique(batch_labels)
         log(f".. Found {len(unique_batches)} batches: {list(unique_batches)}")
 
         results = _process_batches(
             adata, z_labels, batch_labels, background_dict,
-            max_iter, convergence_threshold, iter_loglik,
-            delta, estimate_delta, random_state, verbose, log
+            max_iter, convergence, iter_loglik,
+            delta, estimate_delta, seed, verbose, log
         )
     else:
         # Single batch with  processing
         X_bg = background_dict.get('all', None)
         results = _run_decontx(
-            adata.X, z_labels, X_bg, max_iter, convergence_threshold,
-            iter_loglik, delta, estimate_delta, random_state, verbose, log
+            adata.X, z_labels, X_bg, max_iter, convergence,
+            iter_loglik, delta, estimate_delta, seed, verbose, log
         )
         results = {'all': results}
 
@@ -118,7 +118,7 @@ def decontx(
     # Store comprehensive metadata matching R
     _store_metadata(
         adata, results, delta, estimate_delta, var_genes, dbscan_eps,
-        convergence_threshold, max_iter, random_state, log_messages
+        convergence, max_iter, seed, log_messages
     )
 
     log("-" * 50)
@@ -133,8 +133,8 @@ def decontx(
 def _process_background(
         adata: AnnData,
         background: AnnData,
-        batch_key: Optional[str],
-        bg_batch_key: Optional[str],
+        batch: Optional[str],
+        bg_batch: Optional[str],
         log
 ) -> Dict:
     """ background processing matching R's .checkBackground function."""
@@ -165,9 +165,9 @@ def _process_background(
 
     # Organize by batch with R-style logic
     bg_dict = {}
-    if batch_key is not None and bg_batch_key is not None:
-        main_batches = set(adata.obs[batch_key].unique())
-        bg_batches = set(background.obs[bg_batch_key].unique())
+    if batch is not None and bg_batch is not None:
+        main_batches = set(adata.obs[batch].unique())
+        bg_batches = set(background.obs[bg_batch].unique())
 
         # Check batch compatibility
         missing_bg_batches = main_batches - bg_batches
@@ -175,7 +175,7 @@ def _process_background(
             raise ValueError(f"Background missing batches: {missing_bg_batches}")
 
         for batch in main_batches:
-            batch_mask = background.obs[bg_batch_key] == batch
+            batch_mask = background.obs[bg_batch] == batch
             if np.sum(batch_mask) == 0:
                 log(f".... Warning: No background cells for batch '{batch}'")
                 bg_dict[batch] = None
@@ -194,7 +194,7 @@ def _process_clusters(
         z: Optional[Union[str, np.ndarray]],
         var_genes: int,
         dbscan_eps: float,
-        random_state: int,
+        seed: int,
         log
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """ cluster processing with exact R initialization."""
@@ -205,7 +205,7 @@ def _process_clusters(
         log(".. Generating UMAP and estimating cell types")
         # Use exact R initialization
         z_labels, umap_coords = decontx_initialize_z_exact(
-            adata, var_genes, dbscan_eps, random_state
+            adata, var_genes, dbscan_eps, seed
         )
         n_clusters = len(np.unique(z_labels))
         log(f".... Generated {n_clusters} clusters using DBSCAN (eps={dbscan_eps})")
@@ -237,7 +237,7 @@ def decontx_initialize_z_exact(
         var_genes: int = 5000,
         dbscan_eps: float = 1.0,
         estimate_cell_types: bool = True,
-        random_state: int = 12345
+        seed: int = 12345
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Exact equivalent of R's .decontxInitializeZ function.
@@ -268,7 +268,7 @@ def decontx_initialize_z_exact(
 
     # PCA matching R
     from sklearn.decomposition import PCA
-    pca = PCA(n_components=min(50, counts_filtered.shape[1]), random_state=random_state)
+    pca = PCA(n_components=min(50, counts_filtered.shape[1]), random_state=seed)
     pca_coords = pca.fit_transform(counts_filtered)
 
     # UMAP with exact R parameters
@@ -277,7 +277,7 @@ def decontx_initialize_z_exact(
         min_dist=0.01,
         spread=1.0,
         n_components=2,
-        random_state=random_state,
+        random_state=seed,
         metric='euclidean'
     )
     umap_coords = reducer.fit_transform(pca_coords)
@@ -304,7 +304,7 @@ def decontx_initialize_z_exact(
         # Fallback to k-means if DBSCAN fails
         if total_clusters <= 1:
             from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=10)
+            kmeans = KMeans(n_clusters=2, random_state=seed, n_init=10)
             cluster_labels = kmeans.fit_predict(umap_coords)
 
         # Convert to 1-indexed like R
@@ -317,11 +317,11 @@ def _run_decontx(
         z_labels: np.ndarray,
         X_background: Optional[Union[np.ndarray, csr_matrix]],
         max_iter: int,
-        convergence_threshold: float,
+        convergence: float,
         iter_loglik: int,
         delta: Tuple[float, float],
         estimate_delta: bool,
-        random_state: int,
+        seed: int,
         verbose: bool,
         log
 ) -> Dict:
@@ -332,11 +332,11 @@ def _run_decontx(
     # Use  model
     model = DecontXModel(
         max_iter=max_iter,
-        convergence_threshold=convergence_threshold,
+        convergence=convergence,
         delta=delta,
         estimate_delta=estimate_delta,
         iter_loglik=iter_loglik,
-        random_state=random_state,
+        seed=seed,
         verbose=verbose
     )
 
@@ -360,11 +360,11 @@ def _process_batches(
         batch_labels: np.ndarray,
         background_dict: Dict,
         max_iter: int,
-        convergence_threshold: float,
+        convergence: float,
         iter_loglik: int,
         delta: Tuple[float, float],
         estimate_delta: bool,
-        random_state: int,
+        seed: int,
         verbose: bool,
         log
 ) -> Dict:
@@ -390,8 +390,8 @@ def _process_batches(
 
         # Run  decontamination
         result = _run_decontx(
-            X_batch, z_batch, X_bg, max_iter, convergence_threshold,
-            iter_loglik, delta, estimate_delta, random_state, verbose, log
+            X_batch, z_batch, X_bg, max_iter, convergence,
+            iter_loglik, delta, estimate_delta, seed, verbose, log
         )
 
         # Store with batch info
@@ -454,9 +454,9 @@ def _store_metadata(
         estimate_delta: bool,
         var_genes: int,
         dbscan_eps: float,
-        convergence_threshold: float,
+        convergence: float,
         max_iter: int,
-        random_state: int,
+        seed: int,
         log_messages: List[str]
 ):
     """Store comprehensive metadata matching R's exact structure."""
@@ -467,10 +467,10 @@ def _store_metadata(
             'delta': delta,
             'estimateDelta': estimate_delta,
             'maxIter': max_iter,
-            'convergence': convergence_threshold,
+            'convergence': convergence,
             'varGenes': var_genes,
             'dbscanEps': dbscan_eps,
-            'seed': random_state
+            'seed': seed
         },
         'estimates': {},
         'log': log_messages

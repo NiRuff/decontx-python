@@ -12,11 +12,11 @@ def simulate_contamination(
         beta: float = 0.1,
         delta: Union[float, Tuple[float, float]] = (1.0, 10.0),
         num_markers: int = 3,
-        random_state: int = 12345,
+        seed: int = 12345,
 ) -> Dict:
     """ simulation matching R's simulateContamination exactly."""
 
-    np.random.seed(random_state)
+    np.random.seed(seed)
 
     # Handle delta parameter like R
     if isinstance(delta, (int, float)):

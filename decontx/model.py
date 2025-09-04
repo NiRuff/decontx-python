@@ -8,6 +8,7 @@ from numba import jit, prange
 from scipy import optimize
 from scipy.special import digamma, polygamma, gammaln
 from scipy.stats import beta, dirichlet
+from scipy.sparse import issparse, csr_matrix
 from typing import Tuple, Optional, Dict
 import warnings
 
@@ -18,7 +19,8 @@ from .fast_ops import (
     decontx_log_likelihood_exact,
     col_sum_by_group_change_sparse_wrapper,
     row_sum_by_group_change_sparse,
-    fast_norm_prop_sqrt
+    fast_norm_prop_sqrt,
+    calculate_native_matrix_fast
 )
 
 
@@ -34,7 +36,7 @@ class DecontXModel:
         self.delta = np.array(kwargs.get('delta', [10.0, 10.0]))
         self.estimate_delta = kwargs.get('estimate_delta', True)
         self.iter_loglik = kwargs.get('iter_loglik', 10)
-        self.random_state = kwargs.get('random_state', 12345)
+        self.seed = kwargs.get('seed', 12345)
         self.verbose = kwargs.get('verbose', True)
 
         # Storage for results
@@ -52,7 +54,7 @@ class DecontXModel:
         """
         Fit using exact R algorithm with proper fast operations.
         """
-        np.random.seed(self.random_state)
+        np.random.seed(self.seed)
 
         if not isinstance(X, np.ndarray):
             X = X.toarray() if hasattr(X, 'toarray') else np.asarray(X)
@@ -62,7 +64,7 @@ class DecontXModel:
         n_clusters = len(np.unique(z))
 
         # Initialize parameters exactly like R
-        theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.random_state)
+        theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.seed)
 
         # Use the exact initialization function
         phi, eta = decontx_initialize_exact(X, theta, z)
