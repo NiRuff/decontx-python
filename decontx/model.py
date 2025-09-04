@@ -299,6 +299,7 @@ class DecontXModel:
             'theta': theta,
             'phi': phi,
             'eta': eta,
+            'delta': self.delta,
             'z': z,
             'log_likelihood': log_likelihood_history
         }
