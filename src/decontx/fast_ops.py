@@ -369,3 +369,173 @@ def decontx_log_likelihood_exact(
                 log_likelihood += counts[j, g] * np.log(mixture_prob)
 
     return log_likelihood
+
+@jit(nopython=True, parallel=True)
+def fast_norm_prop_sqrt(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
+    """
+    Fast column-wise normalization to proportions with square root transformation.
+    Equivalent to R's fastNormPropSqrt.
+    """
+    n_rows, n_cols = X.shape
+    result = np.zeros_like(X, dtype=np.float64)
+
+    for j in prange(n_cols):
+        # First pass: compute sum of square roots
+        col_sum = 0.0
+        for i in range(n_rows):
+            col_sum += np.sqrt(X[i, j] + alpha)
+
+        # Second pass: normalize
+        for i in range(n_rows):
+            result[i, j] = np.sqrt(X[i, j] + alpha) / col_sum
+
+    return result
+
+
+@jit(nopython=True)
+def col_sum_by_group_change_sparse(
+        data: np.ndarray,
+        indices: np.ndarray,
+        indptr: np.ndarray,
+        px: np.ndarray,
+        group: np.ndarray,
+        pgroup: np.ndarray,
+        K: int,
+        n_features: int
+) -> np.ndarray:
+    """
+    Column sum by group with change tracking for sparse matrices.
+    Equivalent to R's colSumByGroupChangeSparse.
+
+    This tracks changes when reassigning cells from one group to another.
+    px: index of cell being reassigned
+    pgroup: previous group assignment
+    """
+    result = np.zeros((n_features, K))
+    n_samples = len(group)
+
+    for j in range(n_samples):
+        current_group = group[j] - 1  # Convert to 0-indexed
+
+        # Handle the cell being changed
+        if j == px:
+            # Remove contribution from previous group and add to new group
+            prev_group = pgroup - 1  # Convert to 0-indexed
+
+            # Add to new group
+            if 0 <= current_group < K:
+                for idx in range(indptr[j], indptr[j + 1]):
+                    i = indices[idx]
+                    result[i, current_group] += data[idx]
+
+            # Subtract from previous group (handled implicitly by not adding)
+            continue
+
+        # Regular processing for other cells
+        if 0 <= current_group < K:
+            for idx in range(indptr[j], indptr[j + 1]):
+                i = indices[idx]
+                result[i, current_group] += data[idx]
+
+    return result
+
+
+def col_sum_by_group_change_sparse_wrapper(
+        X_sparse,
+        px: int,
+        group: np.ndarray,
+        pgroup: int,
+        K: int
+) -> np.ndarray:
+    """Wrapper for sparse matrix group sums with change tracking."""
+    X_csr = X_sparse.tocsr()
+    return col_sum_by_group_change_sparse(
+        X_csr.data, X_csr.indices, X_csr.indptr, px, group, pgroup, K, X_csr.shape[0]
+    )
+
+
+@jit(nopython=True)
+def row_sum_by_group_sparse_data(
+        data: np.ndarray,
+        indices: np.ndarray,
+        indptr: np.ndarray,
+        group: np.ndarray,
+        L: int,
+        n_features: int
+) -> np.ndarray:
+    """
+    Row sum by group for sparse matrices.
+    Equivalent to R's rowSumByGroupSparse.
+    """
+    result = np.zeros((n_features, L))
+    n_samples = len(group)
+
+    for j in range(n_samples):
+        group_idx = group[j] - 1  # Convert to 0-indexed
+        if 0 <= group_idx < L:
+            for idx in range(indptr[j], indptr[j + 1]):
+                feature_idx = indices[idx]
+                result[feature_idx, group_idx] += data[idx]
+
+    return result
+
+
+def row_sum_by_group_sparse(X_sparse, group: np.ndarray, L: int) -> np.ndarray:
+    """Wrapper for sparse matrix row sums by group."""
+    X_csr = X_sparse.tocsr()
+    return row_sum_by_group_sparse_data(
+        X_csr.data, X_csr.indices, X_csr.indptr, group, L, X_csr.shape[0]
+    )
+
+
+@jit(nopython=True)
+def row_sum_by_group_change_sparse_data(
+        data: np.ndarray,
+        indices: np.ndarray,
+        indptr: np.ndarray,
+        px: int,
+        group: np.ndarray,
+        pgroup: int,
+        L: int,
+        n_features: int
+) -> np.ndarray:
+    """
+    Row sum by group with change tracking for sparse matrices.
+    Equivalent to R's rowSumByGroupChangeSparse.
+    """
+    result = np.zeros((n_features, L))
+    n_samples = len(group)
+
+    for j in range(n_samples):
+        current_group = group[j] - 1  # Convert to 0-indexed
+
+        # Handle the cell being changed
+        if j == px:
+            # Add to new group only
+            if 0 <= current_group < L:
+                for idx in range(indptr[j], indptr[j + 1]):
+                    feature_idx = indices[idx]
+                    result[feature_idx, current_group] += data[idx]
+            continue
+
+        # Regular processing for other cells
+        if 0 <= current_group < L:
+            for idx in range(indptr[j], indptr[j + 1]):
+                feature_idx = indices[idx]
+                result[feature_idx, current_group] += data[idx]
+
+    return result
+
+
+def row_sum_by_group_change_sparse(
+        X_sparse,
+        px: int,
+        group: np.ndarray,
+        pgroup: int,
+        L: int
+) -> np.ndarray:
+    """Wrapper for sparse matrix row sums by group with change tracking."""
+    X_csr = X_sparse.tocsr()
+    return row_sum_by_group_change_sparse_data(
+        X_csr.data, X_csr.indices, X_csr.indptr, px, group, pgroup, L, X_csr.shape[0]
+    )
