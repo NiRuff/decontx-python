@@ -9,10 +9,11 @@ __version__ = "0.1.0"
 
 from .core import (
     decontx,
-    get_decontx_counts,
-    get_decontx_contamination,
-    get_decontx_clusters
+    # get_decontx_counts,
+    # get_decontx_contamination,
+    # get_decontx_clusters
 )
+
 from .simulation import simulate_contamination
 from .plotting import (
     plot_contamination_umap,

@@ -73,3 +73,89 @@ def validate_inputs(adata: AnnData, z: Optional[str], batch_key: Optional[str]):
         small_batches = batch_counts[batch_counts < 10].index.tolist()
         if small_batches:
             warnings.warn(f"Small batches detected (< 10 cells): {small_batches}")
+
+
+def retrieveFeatureIndex(features, x, by="rownames", exactMatch=True, removeNA=False):
+    """Exact equivalent of R's retrieveFeatureIndex function"""
+
+    # Extract search vector
+    if by == "rownames":
+        if hasattr(x, 'var_names') and x.var_names is not None:
+            search = x.var_names.tolist()
+        elif hasattr(x, 'index'):
+            search = x.index.tolist()
+        else:
+            raise ValueError(
+                "'rownames' of 'x' are 'None'. Please set 'rownames' or change 'by' to search a different column in 'x'.")
+    else:
+        if hasattr(x, 'var') and by in x.var.columns:
+            search = x.var[by].tolist()
+        elif hasattr(x, 'columns') and by in x.columns:
+            search = x[by].tolist()
+        else:
+            raise ValueError(f"'{by}' is not a column in 'x'.")
+
+    # Convert to numpy arrays for fast processing
+    features_arr = np.array(features, dtype=str)
+    search_arr = np.array(search, dtype=str)
+
+    # Use fast function
+    indices = retrieve_feature_index_fast(features_arr, search_arr, exactMatch)
+
+    # Convert -1 to NaN
+    indices_float = indices.astype(float)
+    indices_float[indices == -1] = np.nan
+
+    # Check for missing features
+    missing_mask = np.isnan(indices_float)
+    if np.any(missing_mask):
+        missing_features = features_arr[missing_mask]
+        if np.all(missing_mask):
+            if exactMatch:
+                raise ValueError(
+                    f"None of the provided features had matching items in '{by}' within 'x'. Check the spelling or try setting 'exactMatch = False'.")
+            else:
+                raise ValueError(
+                    f"None of the provided features had matching items in '{by}' within 'x'. Check the spelling and make sure 'by' is set to the appropriate place in 'x'.")
+
+        print(f"Warning: The following features were not present in 'x': {', '.join(missing_features)}")
+
+    if removeNA:
+        indices_float = indices_float[~missing_mask]
+
+    return indices_float
+
+
+def checkCountsDecon(counts):
+    """Equivalent to R's .checkCountsDecon"""
+    return _checkCountsDecon(counts)
+
+
+def processCellLabels(z, numCells):
+    """Equivalent to R's .processCellLabels"""
+    if len(z) != numCells:
+        raise ValueError(f"'z' must be of the same length as the number of cells ({numCells}).")
+
+    unique_labels = np.unique(z)
+    if len(unique_labels) < 2:
+        raise ValueError("No need to decontaminate when only one cluster is in the dataset.")
+
+    # Convert to factor-like behavior
+    if not np.issubdtype(z.dtype, np.integer):
+        # Map unique values to sequential integers
+        label_map = {label: i + 1 for i, label in enumerate(unique_labels)}
+        z = np.array([label_map[label] for label in z])
+
+    return z.astype(int)
+
+
+def checkDelta(delta):
+    """Equivalent to R's .checkDelta"""
+    if not isinstance(delta, (list, tuple, np.ndarray)) or len(delta) != 2:
+        raise ValueError("'delta' needs to be a numeric vector of length 2 containing positive values.")
+
+    if not all(isinstance(d, (int, float)) and d > 0 for d in delta):
+        raise ValueError("'delta' needs to be a numeric vector of length 2 containing positive values.")
+
+    return np.array(delta, dtype=float)
+

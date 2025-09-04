@@ -13,9 +13,12 @@ import warnings
 
 # Import the fast operations
 from .fast_ops import (
-    decontx_initialize_exact,
     decontx_em_exact,
-    decontx_log_likelihood_exact
+    decontx_initialize_exact,
+    decontx_log_likelihood_exact,
+    col_sum_by_group_change_sparse_wrapper,
+    row_sum_by_group_change_sparse,
+    fast_norm_prop_sqrt
 )
 
 
@@ -47,7 +50,7 @@ class DecontXModel:
             X_background: Optional[np.ndarray] = None
     ) -> Dict:
         """
-        Fit using exact R algorithm.
+        Fit using exact R algorithm with proper fast operations.
         """
         np.random.seed(self.random_state)
 
@@ -60,55 +63,65 @@ class DecontXModel:
 
         # Initialize parameters exactly like R
         theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.random_state)
+
+        # Use the exact initialization function
         phi, eta = decontx_initialize_exact(X, theta, z)
 
-        # Use empirical distribution for eta if background provided
+        # Handle background exactly like R
         if X_background is not None:
             if not isinstance(X_background, np.ndarray):
                 X_background = X_background.toarray() if hasattr(X_background, 'toarray') else np.asarray(X_background)
 
-            # Empirical contamination distribution
-            bg_counts = np.sum(X_background, axis=0) + 1e-20
-            eta_empirical = bg_counts / np.sum(bg_counts)
-            eta = np.tile(eta_empirical, (n_clusters, 1))
+            # Use fast_norm_prop for background distribution
+            bg_counts_matrix = X_background.T  # Transpose to match expected format
+            eta_bg = fast_norm_prop(bg_counts_matrix, alpha=1e-20)
+            eta = np.tile(eta_bg.mean(axis=1), (n_clusters, 1))
             estimate_eta = False
         else:
             estimate_eta = True
 
-        # Run exact EM algorithm
+        # Prepare for EM iterations
         prev_theta = theta.copy()
         counts_colsums = np.sum(X, axis=1)
+        self.log_likelihood_ = []
+
+        # Convert to CSR matrix if sparse operations needed
+        if issparse(X):
+            X_csr = X.tocsr()
+        else:
+            X_csr = csr_matrix(X)
 
         for iteration in range(self.max_iter):
+            # Use the exact EM function
             theta, phi, eta, delta, contamination = decontx_em_exact(
                 X, counts_colsums, theta, estimate_eta, eta, phi, z,
                 self.estimate_delta, self.delta, 1e-20
             )
 
-            # Update delta
+            # Update delta if requested
             if self.estimate_delta:
                 self.delta = delta
 
             # Check convergence
             max_change = np.max(np.abs(theta - prev_theta))
 
-            # Calculate log-likelihood
+            # Calculate log-likelihood using exact function
             if (iteration + 1) % self.iter_loglik == 0 or max_change < self.convergence_threshold:
                 ll = decontx_log_likelihood_exact(X, theta, eta, phi, z)
                 self.log_likelihood_.append(ll)
 
                 if self.verbose:
-                    print(f"Iteration {iteration + 1}: max_change={max_change:.6f}, LL={ll:.2f}")
+                    _logMessages(f"Iteration {iteration + 1}: max_change={max_change:.6f}, LL={ll:.2f}")
 
             if max_change < self.convergence_threshold:
                 if self.verbose:
-                    print(f"Converged after {iteration + 1} iterations")
+                    _logMessages(f"Converged after {iteration + 1} iterations")
                 break
 
             prev_theta = theta.copy()
 
-        # Calculate decontaminated counts
-        decontaminated_counts = self._calculate_native_counts_exact(X, z, theta, phi, eta)
+        # Calculate decontaminated counts using exact function
+        decontaminated_counts = calculate_native_matrix_fast(X, theta, phi, eta, z)
 
         # Store parameters
         self.phi_ = phi

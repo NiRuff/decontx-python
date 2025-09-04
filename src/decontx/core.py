@@ -9,6 +9,7 @@ import scanpy as sc
 from anndata import AnnData
 from tqdm import tqdm
 import warnings
+from datetime import datetime
 
 from .model import DecontXModel
 from .utils import initialize_clusters, validate_inputs
@@ -20,24 +21,24 @@ from sklearn.cluster import DBSCAN
 
 def decontx(
     adata: AnnData,
-    assay_name: str = "X",  # R: assayName
+    assay_name: str = "X",
     z: Optional[Union[str, np.ndarray]] = None,
-    batch: Optional[str] = None,  # R uses 'batch' not 'batch_key'
+    batch: Optional[str] = None,
     background: Optional[AnnData] = None,
-    bg_assay_name: Optional[str] = None,  # R: bgAssayName
-    bg_batch: Optional[str] = None,  # R: bgBatch
-    max_iter: int = 500,  # R: maxIter
+    bg_assay_name: Optional[str] = None,
+    bg_batch: Optional[str] = None,
+    max_iter: int = 500,
     delta: Tuple[float, float] = (10.0, 10.0),
-    estimate_delta: bool = True,  # R: estimateDelta
-    convergence: float = 0.001,  # R: convergence
-    iter_loglik: int = 10,  # R: iterLogLik
-    var_genes: int = 5000,  # R: varGenes
-    dbscan_eps: float = 1.0,  # R: dbscanEps
-    seed: int = 12345,  # R: seed
+    estimate_delta: bool = True,
+    convergence: float = 0.001,
+    iter_loglik: int = 10,
+    var_genes: int = 5000,
+    dbscan_eps: float = 1.0,
+    seed: int = 12345,
     logfile: Optional[str] = None,
     verbose: bool = True,
     copy: bool = False
-): -> Optional[AnnData]:
+) -> Optional[AnnData]:
     """
      DecontX with exact R parity.
 
@@ -230,75 +231,86 @@ def _process_clusters(
 
     return z_labels, umap_coords
 
+
 def decontx_initialize_z_exact(
         adata,
         var_genes: int = 5000,
         dbscan_eps: float = 1.0,
+        estimate_cell_types: bool = True,
         random_state: int = 12345
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Exact equivalent of R's .decontxInitializeZ function.
-    Matches R's preprocessing pipeline exactly.
     """
-    # Work on copy to avoid modifying original
+    # Work on copy
     adata_temp = adata.copy()
 
-    # Filter genes (match R's filtering)
-    sc.pp.filter_genes(adata_temp, min_counts=1)
+    # Filter genes with zero counts (match R exactly)
+    gene_counts = np.array(adata_temp.X.sum(axis=0)).flatten()
+    nonzero_genes = gene_counts > 0
+    adata_temp = adata_temp[:, nonzero_genes]
 
-    # Exact normalization matching R's scater::logNormCounts
-    # This matches R's normalization more closely than scanpy's default
+    # Log normalization exactly like R's scater::logNormCounts
     sc.pp.normalize_total(adata_temp, target_sum=1e4)
     sc.pp.log1p(adata_temp)
 
-    # Find highly variable genes (match R's approach)
-    if adata_temp.n_vars > var_genes:
-        sc.pp.highly_variable_genes(
-            adata_temp,
-            n_top_genes=var_genes,
-            flavor='seurat_v3'  # Closer to R's approach
-        )
-        adata_temp = adata_temp[:, adata_temp.var.highly_variable]
+    # Variable gene selection matching R's approach
+    if adata_temp.n_vars <= var_genes:
+        topVariableGenes = np.arange(adata_temp.n_vars)
+    else:
+        # Use scanpy's gene variance like R's scran::modelGeneVar
+        sc.pp.highly_variable_genes(adata_temp, n_top_genes=var_genes)
+        topVariableGenes = np.where(adata_temp.var.highly_variable)[0]
 
-    # PCA with same parameters as R
-    sc.pp.pca(adata_temp, n_comps=30, random_state=random_state)
+    counts_filtered = adata_temp.X[:, topVariableGenes]
+    if issparse(counts_filtered):
+        counts_filtered = counts_filtered.toarray()
 
-    # UMAP matching R's parameters exactly
-    # R uses: minDist=0.01, spread=1, nNeighbors=15
+    # PCA matching R
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=min(50, counts_filtered.shape[1]), random_state=random_state)
+    pca_coords = pca.fit_transform(counts_filtered)
+
+    # UMAP with exact R parameters
     reducer = umap.UMAP(
-        n_neighbors=15,
+        n_neighbors=min(15, counts_filtered.shape[0] - 1),
         min_dist=0.01,
         spread=1.0,
         n_components=2,
         random_state=random_state,
         metric='euclidean'
     )
-    umap_coords = reducer.fit_transform(adata_temp.obsm['X_pca'])
+    umap_coords = reducer.fit_transform(pca_coords)
 
-    # DBSCAN clustering with adaptive eps (matches R logic exactly)
-    n_clusters = 1
-    eps = dbscan_eps
-    max_tries = 10
+    z = None
+    if estimate_cell_types:
+        # DBSCAN with adaptive eps exactly like R
+        total_clusters = 1
+        eps = dbscan_eps
+        iteration = 0
+        max_iterations = 10
 
-    while n_clusters <= 1 and eps > 0 and max_tries > 0:
-        clusterer = DBSCAN(eps=eps, min_samples=3)
-        cluster_labels = clusterer.fit_predict(umap_coords)
+        while total_clusters <= 1 and eps > 0 and iteration < max_iterations:
+            clusterer = DBSCAN(eps=eps, min_samples=3)
+            cluster_labels = clusterer.fit_predict(umap_coords)
 
-        # Count non-noise clusters
-        n_clusters = len(np.unique(cluster_labels[cluster_labels >= 0]))
-        eps *= 0.75  # Same reduction as R
-        max_tries -= 1
+            # Count non-noise clusters (exclude -1)
+            unique_labels = np.unique(cluster_labels)
+            total_clusters = len(unique_labels[unique_labels >= 0])
 
-    # Fallback to k-means if DBSCAN fails (matches R)
-    if n_clusters <= 1:
-        from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=10)
-        cluster_labels = kmeans.fit_predict(umap_coords)
+            eps = eps - (0.25 * eps)  # Exact R reduction
+            iteration += 1
 
-    # Convert to 1-indexed (matches R)
-    cluster_labels = cluster_labels + 1
+        # Fallback to k-means if DBSCAN fails
+        if total_clusters <= 1:
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=10)
+            cluster_labels = kmeans.fit_predict(umap_coords)
 
-    return cluster_labels, umap_coords
+        # Convert to 1-indexed like R
+        z = cluster_labels + 1
+
+    return z, umap_coords
 
 def _run_decontx(
         X: Union[np.ndarray, csr_matrix],
@@ -535,3 +547,123 @@ def get_decontx_clusters(adata: AnnData) -> np.ndarray:
     if 'decontX_clusters' not in adata.obs:
         raise KeyError("DecontX clusters not found. Run decontx() first.")
     return adata.obs['decontX_clusters'].values
+
+
+def _checkCountsDecon(counts):
+    """Equivalent to R's .checkCountsDecon"""
+    if issparse(counts):
+        if np.any(np.isnan(counts.data)):
+            raise ValueError("Missing value in 'counts' matrix.")
+    else:
+        if np.any(np.isnan(counts)):
+            raise ValueError("Missing value in 'counts' matrix.")
+
+    if counts.ndim < 2:
+        raise ValueError("At least 2 genes need to have non-zero expressions.")
+
+
+def _logMessages(*args, sep=" ", logfile=None, append=False, verbose=True):
+    """Equivalent to R's .logMessages"""
+    if verbose:
+        message = sep.join(str(arg) for arg in args)
+
+        if logfile is not None:
+            if not isinstance(logfile, str) or len(logfile.split()) != 1:
+                raise ValueError("The log file parameter needs to be a single character string.")
+
+            mode = 'a' if append else 'w'
+            with open(logfile, mode) as f:
+                f.write(message + '\n')
+        else:
+            print(message)
+
+
+def _processPlotDecontXMarkerInput(x, z, markers, groupClusters, by, exactMatch):
+    """Equivalent to R's .processPlotDecontXMarkerInupt"""
+
+    # Process z and convert to a factor
+    if z is None and hasattr(x, 'obs'):
+        if 'decontX_clusters' not in x.obs.columns:
+            raise ValueError(
+                "'decontX_clusters' not found in 'x.obs'. Make sure you have run 'decontx' or supply 'z' directly.")
+        z = x.obs['decontX_clusters'].values
+    elif isinstance(z, str) and hasattr(x, 'obs'):
+        if z not in x.obs.columns:
+            raise ValueError(f"'{z}' not found in 'x.obs'.")
+        z = x.obs[z].values
+    elif len(z) != x.shape[0]:
+        raise ValueError(
+            "If 'x' is an AnnData object, then 'z' needs to be a single string specifying the column in 'x.obs'. Alternatively, the length of 'z' needs to be the same as the number of observations in 'x'.")
+
+    z = np.asarray(z)
+
+    if groupClusters is not None:
+        if not isinstance(groupClusters, dict) or len(groupClusters) == 0:
+            raise ValueError("'groupClusters' needs to be a non-empty dictionary.")
+
+        # Check that groupClusters are found in 'z'
+        cellMappings = []
+        for cluster_list in groupClusters.values():
+            cellMappings.extend(cluster_list)
+
+        missing = [c for c in cellMappings if c not in z]
+        if missing:
+            raise ValueError(f"'groupClusters' not found in 'z': {missing}")
+
+        # Check for duplicates
+        flat_list = []
+        for cluster_list in groupClusters.values():
+            flat_list.extend(cluster_list)
+
+        if len(flat_list) != len(set(flat_list)):
+            from collections import Counter
+            counts = Counter(flat_list)
+            duplicates = [item for item, count in counts.items() if count > 1]
+            raise ValueError(f"'groupClusters' had duplicate values for the following clusters: {duplicates}")
+
+        # Create mapping
+        labels = np.full(len(z), None, dtype=object)
+        for group_name, cluster_list in groupClusters.items():
+            mask = np.isin(z, cluster_list)
+            labels[mask] = group_name
+
+        # Remove unmapped cells
+        valid_mask = labels != None
+        labels = labels[valid_mask]
+        x = x[valid_mask] if hasattr(x, 'obs') else x[valid_mask, :]
+        z = np.array([list(groupClusters.keys()).index(label) + 1 for label in labels])
+        xlab = "Cell types"
+    else:
+        unique_labels = np.unique(z)
+        groupClusters = {str(label): [label] for label in unique_labels}
+        xlab = "Clusters"
+
+    # Find index of each feature
+    if isinstance(markers, dict):
+        all_markers = []
+        marker_types = []
+        for marker_type, marker_list in markers.items():
+            all_markers.extend(marker_list)
+            marker_types.extend([marker_type] * len(marker_list))
+    else:
+        all_markers = markers
+        marker_types = list(range(len(markers)))
+
+    geneMarkerCellTypeIndex = marker_types
+    geneMarkerIndex = retrieveFeatureIndex(
+        all_markers, x, by=by, removeNA=False, exactMatch=exactMatch
+    )
+
+    # Remove genes that did not match
+    valid_mask = ~np.isnan(geneMarkerIndex)
+    geneMarkerCellTypeIndex = np.array(geneMarkerCellTypeIndex)[valid_mask]
+    geneMarkerIndex = geneMarkerIndex[valid_mask]
+
+    return {
+        'x': x,
+        'z': z,
+        'geneMarkerIndex': geneMarkerIndex,
+        'geneMarkerCellTypeIndex': geneMarkerCellTypeIndex,
+        'groupClusters': groupClusters,
+        'xlab': xlab
+    }

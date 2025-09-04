@@ -539,3 +539,42 @@ def row_sum_by_group_change_sparse(
     return row_sum_by_group_change_sparse_data(
         X_csr.data, X_csr.indices, X_csr.indptr, px, group, pgroup, L, X_csr.shape[0]
     )
+
+
+@jit(nopython=True)
+def retrieve_feature_index_fast(features, search_space, exact_match=True):
+    """Equivalent to R's retrieveFeatureIndex core logic"""
+    n_features = len(features)
+    n_search = len(search_space)
+    indices = np.full(n_features, -1, dtype=np.int64)
+
+    if exact_match:
+        for i in range(n_features):
+            feature = features[i]
+            for j in range(n_search):
+                if search_space[j] == feature:
+                    indices[i] = j
+                    break
+    else:
+        # Partial matching - simplified version
+        for i in range(n_features):
+            feature = features[i]
+            matches = []
+            for j in range(n_search):
+                if feature in search_space[j]:
+                    matches.append(j)
+
+            if len(matches) == 1:
+                indices[i] = matches[0]
+            elif len(matches) > 1:
+                indices[i] = matches[0]  # Take first match like R
+
+    return indices
+
+
+@jit(nopython=True)
+def calculate_log_messages_time():
+    """For timestamp functionality matching R"""
+    # This is simplified - in practice you'd want to use datetime
+    # Numba doesn't support datetime directly
+    return 0.0  # Placeholder for timestamp
