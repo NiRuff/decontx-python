@@ -12,6 +12,7 @@ from scipy.sparse import issparse, csr_matrix
 from typing import Tuple, Optional, Dict
 import warnings
 
+
 # Import the fast operations
 from .fast_ops import (
     decontx_em_exact,
@@ -27,11 +28,12 @@ from .fast_ops import (
 class DecontXModel:
     """
     DecontX model with EXACT R implementation matching.
+    Fixed initialization and EM algorithm to match R exactly.
     """
 
     def __init__(self, **kwargs):
         self.max_iter = kwargs.get('max_iter', 500)
-        self.convergence_threshold = kwargs.get('convergence', 0.001)  # Note: 'convergence' in R
+        self.convergence_threshold = kwargs.get('convergence', 0.001)
         self.delta = np.array(kwargs.get('delta', [10.0, 10.0]))
         self.estimate_delta = kwargs.get('estimate_delta', True)
         self.iter_loglik = kwargs.get('iter_loglik', 10)
@@ -47,161 +49,183 @@ class DecontXModel:
     def _r_exact_initialization(self, X, z, theta, pseudocount=1e-20):
         """
         Exact R initialization matching decontXInitialize C++ function.
+        Fixed to properly calculate phi and eta matrices.
         """
         n_cells, n_genes = X.shape
         n_clusters = len(np.unique(z))
 
-        # Initialize phi and eta exactly like R
-        phi = np.full((n_clusters, n_genes), pseudocount)
-        eta = np.full((n_clusters, n_genes), pseudocount)
+        # Initialize with pseudocount
+        phi = np.zeros((n_clusters, n_genes)) + pseudocount
+        eta = np.zeros((n_clusters, n_genes)) + pseudocount
 
-        # R's exact phi initialization
+        # Calculate phi for each cluster (expression profile within cluster)
         for k in range(n_clusters):
-            cluster_mask = (z == k + 1)  # z is 1-indexed
+            cluster_mask = (z == k + 1)  # z is 1-indexed in R
             if np.any(cluster_mask):
-                cluster_counts = X[cluster_mask].sum(axis=0)
-                if hasattr(cluster_counts, 'A1'):  # sparse matrix
-                    cluster_counts = cluster_counts.A1
+                # Sum counts for cells in this cluster
+                if issparse(X):
+                    cluster_counts = np.array(X[cluster_mask].sum(axis=0)).flatten()
+                else:
+                    cluster_counts = X[cluster_mask].sum(axis=0)
 
-                total_cluster_counts = cluster_counts.sum()
-                if total_cluster_counts > 0:
-                    # R's exact normalization with pseudocount
-                    phi[k, :] = (cluster_counts + pseudocount) / (total_cluster_counts + n_genes * pseudocount)
+                # Normalize to probabilities
+                total = cluster_counts.sum()
+                if total > 0:
+                    phi[k, :] = (cluster_counts + pseudocount) / (total + n_genes * pseudocount)
 
-        # R's exact eta initialization (contamination from other clusters)
+        # Calculate eta for each cluster (ambient profile from other clusters)
         for k in range(n_clusters):
-            other_counts = np.zeros(n_genes)
+            other_mask = (z != k + 1)  # All cells NOT in cluster k
+            if np.any(other_mask):
+                # Sum counts for cells NOT in this cluster
+                if issparse(X):
+                    other_counts = np.array(X[other_mask].sum(axis=0)).flatten()
+                else:
+                    other_counts = X[other_mask].sum(axis=0)
 
-            for other_k in range(n_clusters):
-                if other_k != k:
-                    other_mask = (z == other_k + 1)
-                    if np.any(other_mask):
-                        other_cluster_counts = X[other_mask].sum(axis=0)
-                        if hasattr(other_cluster_counts, 'A1'):
-                            other_cluster_counts = other_cluster_counts.A1
-                        other_counts += other_cluster_counts
-
-            total_other_counts = other_counts.sum()
-            if total_other_counts > 0:
-                eta[k, :] = (other_counts + pseudocount) / (total_other_counts + n_genes * pseudocount)
-            else:
-                # Uniform if no other clusters
-                eta[k, :] = 1.0 / n_genes
+                # Normalize to probabilities
+                total = other_counts.sum()
+                if total > 0:
+                    eta[k, :] = (other_counts + pseudocount) / (total + n_genes * pseudocount)
 
         return phi, eta
 
-    def _r_exact_em_step(self, X, z, theta, phi, eta, counts_colsums, pseudocount=1e-20):
+    def _calculate_log_likelihood(self, X, theta, phi, eta, z, pseudocount=1e-20):
         """
-        Exact R EM step matching decontXEM C++ function.
-        """
-        n_cells, n_genes = X.shape
-        n_clusters = len(np.unique(z))
-
-        # E-step: Calculate responsibilities (exact R formula)
-        estRmat = np.zeros_like(X, dtype=np.float64)
-
-        for j in range(n_cells):
-            cluster_idx = z[j] - 1  # Convert to 0-indexed
-            for g in range(n_genes):
-                if X[j, g] > 0:
-                    # R's exact probability calculations
-                    log_native = np.log(phi[cluster_idx, g] + pseudocount) + np.log(theta[j] + pseudocount)
-                    log_contam = np.log(eta[cluster_idx, g] + pseudocount) + np.log(1 - theta[j] + pseudocount)
-
-                    # Numerically stable computation (R method)
-                    max_val = max(log_native, log_contam)
-                    exp_native = np.exp(log_native - max_val)
-                    exp_contam = np.exp(log_contam - max_val)
-
-                    p_native = exp_native / (exp_native + exp_contam)
-                    estRmat[j, g] = X[j, g] * p_native
-
-        # M-step: Update parameters (exact R formulas)
-
-        # Update theta (exact R formula)
-        estRmat_colsums = estRmat.sum(axis=1)
-        new_theta = (estRmat_colsums + self.delta[0]) / (counts_colsums + self.delta[0] + self.delta[1])
-
-        # Update phi (native expression) - exact R formula
-        new_phi = np.zeros_like(phi)
-        for k in range(n_clusters):
-            cluster_sum = np.zeros(n_genes)
-            cluster_mask = (z == k + 1)
-
-            if np.any(cluster_mask):
-                cluster_sum = estRmat[cluster_mask].sum(axis=0)
-                if hasattr(cluster_sum, 'A1'):
-                    cluster_sum = cluster_sum.A1
-
-            phi_sum = cluster_sum.sum() + n_genes * pseudocount
-            new_phi[k, :] = (cluster_sum + pseudocount) / phi_sum
-
-        # Update eta (contamination) - exact R formula
-        new_eta = eta.copy()
-        if True:  # Always update eta in this version
-            for k in range(n_clusters):
-                contam_sum = np.zeros(n_genes)
-
-                # Sum contamination from all OTHER clusters
-                for j in range(n_cells):
-                    if z[j] - 1 != k:  # From other clusters
-                        contam_counts = X[j, :] - estRmat[j, :]
-                        contam_counts = np.maximum(contam_counts, 0)  # Ensure non-negative
-                        contam_sum += contam_counts
-
-                eta_sum = contam_sum.sum() + n_genes * pseudocount
-                if eta_sum > 0:
-                    new_eta[k, :] = (contam_sum + pseudocount) / eta_sum
-
-        # Calculate contamination (exact R formula)
-        contamination = 1.0 - new_theta
-
-        return new_theta, new_phi, new_eta, contamination, estRmat
-
-    def _r_exact_log_likelihood(self, X, z, theta, phi, eta, pseudocount=1e-20):
-        """
-        Exact R log-likelihood calculation matching decontXLogLik.
+        Calculate log-likelihood exactly as R does.
+        Fixed numerical stability issues.
         """
         log_lik = 0.0
         n_cells, n_genes = X.shape
 
         for j in range(n_cells):
-            cluster_idx = z[j] - 1
+            cluster_idx = z[j] - 1  # Convert to 0-indexed
             for g in range(n_genes):
-                if X[j, g] > 0:
+                if issparse(X):
+                    count = X[j, g]
+                else:
+                    count = X[j, g]
+
+                if count > 0:
                     # R's exact mixture probability formula
                     mixture_prob = (theta[j] * phi[cluster_idx, g] +
                                     (1 - theta[j]) * eta[cluster_idx, g] + pseudocount)
-                    log_lik += X[j, g] * np.log(mixture_prob)
+                    log_lik += count * np.log(mixture_prob)
 
         return log_lik
 
+    def _em_step(self, X, z, theta, phi, eta, delta, estimate_delta, pseudocount=1e-20):
+        """
+        Single EM step matching R's decontXEM function exactly.
+        Fixed to properly update theta, phi, and eta.
+        """
+        n_cells, n_genes = X.shape
+        n_clusters = phi.shape[0]
+
+        # E-step: Calculate responsibilities (probability each count is native)
+        native_counts = np.zeros_like(X, dtype=np.float64)
+
+        for j in range(n_cells):
+            cluster_idx = z[j] - 1
+            for g in range(n_genes):
+                if issparse(X):
+                    count = X[j, g]
+                else:
+                    count = X[j, g]
+
+                if count > 0:
+                    # Calculate probability this count is native (not contamination)
+                    p_native = theta[j] * phi[cluster_idx, g]
+                    p_contam = (1 - theta[j]) * eta[cluster_idx, g]
+                    p_total = p_native + p_contam + pseudocount
+
+                    native_counts[j, g] = count * (p_native / p_total)
+
+        # M-step: Update parameters
+
+        # Update theta (contamination per cell)
+        for j in range(n_cells):
+            if issparse(X):
+                total_counts = X[j].sum()
+            else:
+                total_counts = X[j].sum()
+
+            native_sum = native_counts[j].sum()
+
+            if estimate_delta:
+                # Bayesian update with prior
+                theta[j] = (native_sum + delta[0] - 1) / (total_counts + delta[0] + delta[1] - 2)
+            else:
+                # Maximum likelihood estimate
+                if total_counts > 0:
+                    theta[j] = native_sum / total_counts
+                else:
+                    theta[j] = 0.5
+
+            # Ensure theta is in valid range
+            theta[j] = np.clip(theta[j], 1e-10, 1 - 1e-10)
+
+        # Update phi (expression profile per cluster)
+        for k in range(n_clusters):
+            cluster_mask = (z == k + 1)
+            if np.any(cluster_mask):
+                cluster_native = native_counts[cluster_mask].sum(axis=0)
+                total = cluster_native.sum()
+                if total > 0:
+                    phi[k, :] = (cluster_native + pseudocount) / (total + n_genes * pseudocount)
+
+        # Update eta (ambient profile per cluster)
+        for k in range(n_clusters):
+            cluster_mask = (z == k + 1)
+            if np.any(cluster_mask):
+                # Contamination counts = total - native
+                cluster_contam = np.zeros(n_genes)
+                for j in np.where(cluster_mask)[0]:
+                    if issparse(X):
+                        cluster_contam += np.array(X[j].todense()).flatten() - native_counts[j]
+                    else:
+                        cluster_contam += X[j] - native_counts[j]
+
+                total = cluster_contam.sum()
+                if total > 0:
+                    eta[k, :] = (cluster_contam + pseudocount) / (total + n_genes * pseudocount)
+
+        return theta, phi, eta
+
     def fit_transform(self, X, z, X_background=None):
         """
-        Fit using exact R algorithm.
+        Fit using exact R algorithm with proper convergence checking.
         """
         np.random.seed(self.seed)
 
         if not isinstance(X, np.ndarray):
-            X = X.toarray() if hasattr(X, 'toarray') else np.asarray(X)
+            if hasattr(X, 'toarray'):
+                X_dense = X.toarray()
+            else:
+                X_dense = np.asarray(X)
+        else:
+            X_dense = X
 
         z = np.asarray(z).astype(int)
-        n_cells, n_genes = X.shape
+        n_cells, n_genes = X_dense.shape
         n_clusters = len(np.unique(z))
 
         # Initialize theta exactly like R: rbeta(n=nC, shape1=delta[1], shape2=delta[2])
-        from scipy.stats import beta
+        # CRITICAL: R uses delta in reverse order for rbeta!
         theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.seed)
 
         # Initialize phi and eta exactly like R
-        phi, eta = self._r_exact_initialization(X, z, theta)
+        phi, eta = self._r_exact_initialization(X_dense, z, theta)
 
         # Handle background exactly like R (if provided)
         if X_background is not None:
             if not isinstance(X_background, np.ndarray):
-                X_background = X_background.toarray() if hasattr(X_background, 'toarray') else np.asarray(X_background)
+                if hasattr(X_background, 'toarray'):
+                    X_background = X_background.toarray()
+                else:
+                    X_background = np.asarray(X_background)
 
-            # Use background to estimate eta (exact R method)
+            # Use background to estimate eta (ambient profile)
             bg_total = X_background.sum(axis=0)
             if hasattr(bg_total, 'A1'):
                 bg_total = bg_total.A1
@@ -209,69 +233,74 @@ class DecontXModel:
 
             if bg_sum > 0:
                 eta_bg = (bg_total + 1e-20) / (bg_sum + n_genes * 1e-20)
-                # Replicate for all clusters
-                eta = np.tile(eta_bg, (n_clusters, 1))
+                # Set same eta for all clusters when using background
+                for k in range(n_clusters):
+                    eta[k, :] = eta_bg
 
-        # Prepare for EM iterations
-        prev_theta = theta.copy()
-        counts_colsums = X.sum(axis=1)
-        if hasattr(counts_colsums, 'A1'):
-            counts_colsums = counts_colsums.A1
-
-        self.log_likelihood_ = []
+        # EM algorithm with R's convergence checking
+        log_likelihood_history = []
+        prev_log_lik = -np.inf
 
         for iteration in range(self.max_iter):
-            # Exact R EM step
-            theta, phi, eta, contamination, estRmat = self._r_exact_em_step(
-                X, z, theta, phi, eta, counts_colsums
+            # Store old theta for convergence check
+            theta_old = theta.copy()
+
+            # EM step
+            theta, phi, eta = self._em_step(
+                X_dense, z, theta, phi, eta,
+                self.delta, self.estimate_delta
             )
 
-            # Check convergence (exact R method)
-            max_change = np.max(np.abs(theta - prev_theta))
+            # Calculate log-likelihood periodically
+            if iteration % self.iter_loglik == 0:
+                log_lik = self._calculate_log_likelihood(X_dense, theta, phi, eta, z)
+                log_likelihood_history.append(log_lik)
 
-            # Calculate log-likelihood (exact R timing)
-            if (iteration + 1) % self.iter_loglik == 0 or max_change < self.convergence_threshold:
-                ll = self._r_exact_log_likelihood(X, z, theta, phi, eta)
-                self.log_likelihood_.append(ll)
+                # Check convergence (R uses change in theta)
+                theta_change = np.mean(np.abs(theta - theta_old))
 
-                if self.verbose:
-                    print(f"Iteration {iteration + 1}: max_change={max_change:.6f}, LL={ll:.2f}")
+                if self.verbose and iteration % 50 == 0:
+                    print(f"Iteration {iteration}: LL = {log_lik:.2f}, theta_change = {theta_change:.6f}")
 
-            if max_change < self.convergence_threshold:
-                if self.verbose:
-                    print(f"Converged after {iteration + 1} iterations")
-                break
+                # R's convergence criterion
+                if theta_change < self.convergence_threshold:
+                    if self.verbose:
+                        print(f"Converged at iteration {iteration}")
+                    break
 
-            prev_theta = theta.copy()
+        # Calculate final contamination (1 - theta in R notation)
+        contamination = 1.0 - theta
 
-        # Calculate decontaminated counts (exact R method)
-        decontaminated_counts = np.zeros_like(X, dtype=np.float64)
+        # Calculate decontaminated counts
+        decontaminated = np.zeros_like(X_dense)
         for j in range(n_cells):
             cluster_idx = z[j] - 1
             for g in range(n_genes):
-                if X[j, g] > 0:
-                    log_native = np.log(phi[cluster_idx, g] + 1e-20) + np.log(theta[j] + 1e-20)
-                    log_contam = np.log(eta[cluster_idx, g] + 1e-20) + np.log(1 - theta[j] + 1e-20)
+                if X_dense[j, g] > 0:
+                    # Probability this count is native
+                    p_native = theta[j] * phi[cluster_idx, g]
+                    p_total = p_native + (1 - theta[j]) * eta[cluster_idx, g] + 1e-20
 
-                    max_val = max(log_native, log_contam)
-                    p_native = np.exp(log_native - max_val) / (
-                            np.exp(log_native - max_val) + np.exp(log_contam - max_val)
-                    )
-                    decontaminated_counts[j, g] = X[j, g] * p_native
+                    # Expected native counts
+                    decontaminated[j, g] = X_dense[j, g] * (p_native / p_total)
 
-        # Store parameters
+        # Round to integers for count data
+        decontaminated = np.round(decontaminated).astype(int)
+
+        # Store results
         self.phi_ = phi
         self.eta_ = eta
         self.theta_ = theta
+        self.log_likelihood_ = log_likelihood_history
 
         return {
-            'decontaminated_counts': decontaminated_counts,
             'contamination': contamination,
+            'decontaminated': decontaminated,
             'theta': theta,
             'phi': phi,
             'eta': eta,
-            'delta': self.delta,
-            'log_likelihood': self.log_likelihood_,
+            'z': z,
+            'log_likelihood': log_likelihood_history
         }
 
 

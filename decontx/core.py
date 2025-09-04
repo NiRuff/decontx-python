@@ -2,22 +2,22 @@
 Core DecontX functionality with complete feature parity to R version.
 """
 
-import numpy as np
 import pandas as pd
-from typing import Optional, Union, Tuple, List, Dict
+from typing import Optional, Union, Tuple, List, Dict, np.ndarray
 import scanpy as sc
 from anndata import AnnData
 from tqdm import tqdm
 import warnings
 from datetime import datetime
+import numpy as np
+from scipy.sparse import issparse, csr_matrix
+import umap
+from sklearn.cluster import DBSCAN, KMeans
 
 from .model import DecontXModel
 from .utils import initialize_clusters, validate_inputs
 from .fast_ops import calculate_native_matrix_fast
 
-from scipy.sparse import issparse, csr_matrix
-import umap
-from sklearn.cluster import DBSCAN
 
 
 def decontx(
@@ -233,19 +233,16 @@ def _process_clusters(
 
 def decontx_initialize_z_exact(
         adata,
-        var_genes: int = 2000,  # R default, not 5000
+        var_genes: int = 2000,  # R default
         dbscan_eps: float = 1.0,
         estimate_cell_types: bool = True,
         seed: int = 12345
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Exact equivalent of R's .decontxInitializeZ function.
-    """
-    import scanpy as sc
-    from sklearn.decomposition import PCA
-    from sklearn.cluster import DBSCAN, KMeans
-    import umap
 
+    Key fix: Use normalized counts DIRECTLY for UMAP (no PCA!), matching R exactly.
+    """
     # Work on copy and filter zero genes EXACTLY like R
     adata_temp = adata.copy()
     gene_counts = np.array(adata_temp.X.sum(axis=0)).flatten()
@@ -253,7 +250,7 @@ def decontx_initialize_z_exact(
     adata_temp = adata_temp[:, nonzero_genes]
 
     # EXACT R normalization: scater::logNormCounts(sce, log = TRUE)
-    # This does: (counts / lib_size) * median(lib_sizes) + 1, then log2
+    # Formula: log2((counts / lib_size) * median(lib_sizes) + 1)
     lib_sizes = np.array(adata_temp.X.sum(axis=1)).flatten()
     median_lib_size = np.median(lib_sizes)
 
@@ -265,13 +262,10 @@ def decontx_initialize_z_exact(
     for i in range(adata_temp.n_obs):
         X_norm[i, :] = np.log2((X_norm[i, :] / lib_sizes[i]) * median_lib_size + 1)
 
-    adata_temp.X = X_norm
-
     # Variable gene selection matching R's scran::modelGeneVar approach
     if adata_temp.n_vars <= var_genes:
         top_var_genes = np.arange(adata_temp.n_vars)
     else:
-        # Simplified version of scran::modelGeneVar logic
         # Calculate per-gene variance and mean
         gene_means = np.mean(X_norm, axis=0)
         gene_vars = np.var(X_norm, axis=0)
@@ -283,24 +277,35 @@ def decontx_initialize_z_exact(
 
         top_var_genes = np.argsort(bio_var)[::-1][:var_genes]
 
+    # Filter to variable genes
     counts_filtered = X_norm[:, top_var_genes]
 
-    # PCA exactly like R (but R uses more sophisticated method)
-    n_pcs = min(50, counts_filtered.shape[1], counts_filtered.shape[0] - 1)
-    pca = PCA(n_components=n_pcs, random_state=seed)
-    pca_coords = pca.fit_transform(counts_filtered)
-
-    # UMAP with EXACT R parameters
+    # CRITICAL FIX: Use normalized counts DIRECTLY for UMAP (no PCA!)
+    # R feeds the normalized, filtered counts directly to UMAP
     n_neighbors = min(15, counts_filtered.shape[0] - 1)
+
+    # UMAP with EXACT R parameters on the NORMALIZED COUNTS
     reducer = umap.UMAP(
         n_neighbors=n_neighbors,
         min_dist=0.01,  # R exact
         spread=1.0,  # R exact
         n_components=2,
         random_state=seed,
-        metric='euclidean'
+        metric='euclidean',
+        n_epochs=None,  # Let UMAP decide (R default)
+        learning_rate=1.0,  # R default
+        init='spectral',  # R default
+        negative_sample_rate=5,  # R default
+        transform_queue_size=4.0,  # R default
+        a=None,  # Computed from spread and min_dist
+        b=None  # Computed from spread and min_dist
     )
-    umap_coords = reducer.fit_transform(pca_coords)
+
+    # TRANSPOSE for UMAP (R uses t() before UMAP)
+    # R does: umap(t(countsFiltered)) where countsFiltered is genes x cells
+    # So we need cells x genes -> transpose to genes x cells -> transpose again for umap
+    # Net result: use counts_filtered directly (cells x genes)
+    umap_coords = reducer.fit_transform(counts_filtered)
 
     z = None
     if estimate_cell_types:
@@ -320,7 +325,7 @@ def decontx_initialize_z_exact(
             non_noise_labels = unique_labels[unique_labels >= 0]
             total_clusters = len(non_noise_labels)
 
-            # R's exact eps reduction
+            # R's exact eps reduction: 25% reduction each iteration
             eps = eps - (0.25 * eps)
             iteration += 1
 
@@ -332,10 +337,22 @@ def decontx_initialize_z_exact(
 
         # Convert to 1-indexed like R (CRITICAL!)
         if total_clusters > 1:
-            # Map noise points (-1) to smallest cluster
+            # Map noise points (-1) to 0, then add 1 for R-style 1-indexing
             if -1 in cluster_labels:
-                cluster_labels[cluster_labels == -1] = 0
-            z = cluster_labels + 1
+                # Find smallest cluster to assign noise points to
+                non_noise_mask = cluster_labels != -1
+                if non_noise_mask.any():
+                    unique_non_noise = np.unique(cluster_labels[non_noise_mask])
+                    cluster_sizes = {c: np.sum(cluster_labels == c) for c in unique_non_noise}
+                    smallest_cluster = min(cluster_sizes, key=cluster_sizes.get)
+                    cluster_labels[cluster_labels == -1] = smallest_cluster
+                else:
+                    cluster_labels[cluster_labels == -1] = 0
+
+            # Ensure sequential labeling starting from 0
+            unique_labels = np.unique(cluster_labels)
+            label_map = {old_label: new_label for new_label, old_label in enumerate(unique_labels)}
+            z = np.array([label_map[x] for x in cluster_labels]) + 1  # Add 1 for R-style indexing
         else:
             z = np.ones(len(cluster_labels), dtype=int)
 
@@ -529,8 +546,13 @@ def _store_metadata(
 
 
 def _process_cell_labels(z: np.ndarray, n_cells: int) -> np.ndarray:
-    """Exact R cell label processing matching .processCellLabels."""
+    """
+    Process cell labels to match R's exact requirements.
+    Updated to ensure proper 1-indexing and sequential labeling.
+    """
+    z = np.asarray(z)
 
+    # Check length
     if len(z) != n_cells:
         raise ValueError(f"Cluster labels length ({len(z)}) != number of cells ({n_cells})")
 
@@ -541,14 +563,19 @@ def _process_cell_labels(z: np.ndarray, n_cells: int) -> np.ndarray:
 
     # Convert to numeric if needed (R behavior)
     if not np.issubdtype(z.dtype, np.integer):
-        # R's plyr::mapvalues equivalent - map to sequential integers
+        # Map to sequential integers starting from 1
         label_map = {label: i + 1 for i, label in enumerate(unique_labels)}
         z = np.array([label_map[x] for x in z])
-
-    # Ensure 1-indexed (R requirement)
-    min_label = np.min(z)
-    if min_label <= 0:
-        z = z - min_label + 1
+    else:
+        # Ensure sequential labeling starting from 1
+        min_label = np.min(z)
+        if min_label <= 0:
+            # Shift to start from 1
+            z = z - min_label + 1
+        elif min_label > 1:
+            # Remap to sequential starting from 1
+            label_map = {label: i + 1 for i, label in enumerate(np.sort(unique_labels))}
+            z = np.array([label_map[x] for x in z])
 
     return z.astype(int)
 
