@@ -8,12 +8,15 @@ from numba import jit, prange
 from scipy import optimize
 from scipy.special import digamma, polygamma, gammaln
 from scipy.stats import beta, dirichlet
-# from sklearn.mixture import BayesianGaussianMixture
-import scanpy as sc
-import umap
-from sklearn.cluster import DBSCAN
 from typing import Tuple, Optional, Dict
 import warnings
+
+# Import the fast operations
+from .fast_ops import (
+    decontx_initialize_exact,
+    decontx_em_exact,
+    decontx_log_likelihood_exact
+)
 
 
 class DecontXModel:
@@ -143,89 +146,3 @@ class DecontXModel:
         return native_counts
 
 
-
-#
-# def fit_dirichlet_moments(data: np.ndarray, max_iter: int = 1000, tol: float = 1e-6) -> np.ndarray:
-#     """
-#     Fit Dirichlet distribution parameters using method of moments.
-#     More sophisticated version matching R's MCMCprecision::fit_dirichlet behavior.
-#     """
-#     # Remove rows with all zeros or invalid values
-#     valid_mask = np.all(np.isfinite(data), axis=1) & (np.sum(data, axis=1) > 0)
-#     clean_data = data[valid_mask]
-#
-#     if len(clean_data) < 2:
-#         return np.array([1.0, 1.0])
-#
-#     # Normalize to ensure they sum to 1
-#     clean_data = clean_data / clean_data.sum(axis=1, keepdims=True)
-#
-#     # Method of moments initialization
-#     means = np.mean(clean_data, axis=0)
-#
-#     # Calculate sample covariance
-#     centered = clean_data - means
-#     cov_matrix = np.cov(centered.T)
-#
-#     # Method of moments estimate for concentration
-#     var_sum = np.trace(cov_matrix)
-#     mean_sum_sq = np.sum(means ** 2)
-#
-#     if var_sum > 0 and mean_sum_sq > 0:
-#         alpha_sum = (mean_sum_sq - var_sum) / var_sum
-#         if alpha_sum > 0:
-#             alphas = means * alpha_sum
-#             # Ensure minimum values
-#             alphas = np.maximum(alphas, 0.1)
-#             return alphas
-#
-#     # Fallback to equal parameters
-#     return np.ones(data.shape[1]) * 0.5
-#
-#
-# def fit_beta_precise(theta_values: np.ndarray) -> np.ndarray:
-#     """
-#     Precise beta distribution fitting matching R's approach.
-#     """
-#     # Remove invalid values
-#     valid_theta = theta_values[np.isfinite(theta_values)]
-#     valid_theta = np.clip(valid_theta, 1e-10, 1 - 1e-10)
-#
-#     if len(valid_theta) < 2:
-#         return np.array([10.0, 10.0])
-#
-#     # Method of moments
-#     mean_val = np.mean(valid_theta)
-#     var_val = np.var(valid_theta)
-#
-#     if var_val > 0 and var_val < mean_val * (1 - mean_val):
-#         # Method of moments estimator
-#         common = mean_val * (1 - mean_val) / var_val - 1
-#         if common > 0:
-#             alpha = mean_val * common
-#             beta_param = (1 - mean_val) * common
-#             return np.array([max(alpha, 0.1), max(beta_param, 0.1)])
-#
-#     # Fallback using MLE
-#     def neg_log_likelihood(params):
-#         alpha, beta_param = params
-#         if alpha <= 0 or beta_param <= 0:
-#             return np.inf
-#         try:
-#             return -np.sum(beta.logpdf(valid_theta, alpha, beta_param))
-#         except:
-#             return np.inf
-#
-#     try:
-#         result = optimize.minimize(
-#             neg_log_likelihood,
-#             x0=[1.0, 1.0],
-#             bounds=[(0.1, 100), (0.1, 100)],
-#             method='L-BFGS-B'
-#         )
-#         if result.success:
-#             return result.x
-#     except:
-#         pass
-#
-#     return np.array([10.0, 10.0])
