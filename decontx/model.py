@@ -50,9 +50,16 @@ class DecontXModel:
 
     def _r_exact_initialization(self, X, z, theta, pseudocount=1e-20):
         """
-        Wrapper for R-exact initialization using fast compiled function.
+        CORRECTED: Use the fixed initialization that properly calculates eta.
         """
-        # Just call the fast compiled version
+        # Ensure proper data types
+        if issparse(X):
+            X = X.toarray()
+        X = np.ascontiguousarray(X, dtype=np.float64)
+        z = np.ascontiguousarray(z, dtype=np.int32)
+        theta = np.ascontiguousarray(theta, dtype=np.float64)
+
+        # Call the corrected initialization
         return decontx_initialize_exact(X, theta, z, pseudocount)
 
     def fit_transform(self, X, z, X_background=None):

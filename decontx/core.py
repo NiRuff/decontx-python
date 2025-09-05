@@ -233,82 +233,53 @@ def _process_clusters(
 
 def decontx_initialize_z_exact(
         adata,
-        var_genes: int = 2000,  # R default
+        var_genes: int = 2000,
         dbscan_eps: float = 1.0,
         estimate_cell_types: bool = True,
         seed: int = 12345
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Exact equivalent of R's .decontxInitializeZ function.
-    Fixed to match R's behavior exactly.
+    CORRECTED: More accurate R normalization.
     """
     np.random.seed(seed)
 
-    # Work on copy and filter zero genes EXACTLY like R
     adata_temp = adata.copy()
+
+    # Filter zero genes exactly like R
     gene_counts = np.array(adata_temp.X.sum(axis=0)).flatten()
     nonzero_genes = gene_counts > 0
     adata_temp = adata_temp[:, nonzero_genes]
 
-    # EXACT R normalization: scater::logNormCounts(sce, log = TRUE)
-    lib_sizes = np.array(adata_temp.X.sum(axis=1)).flatten()
-    median_lib_size = np.median(lib_sizes)
-
+    # R's exact normalization with size factors
     X_norm = adata_temp.X.copy()
     if issparse(X_norm):
         X_norm = X_norm.toarray()
 
-    # R's exact normalization formula with log2
-    for i in range(adata_temp.n_obs):
-        if lib_sizes[i] > 0:
-            X_norm[i, :] = np.log2((X_norm[i, :] / lib_sizes[i]) * median_lib_size + 1)
+    # Calculate size factors (library size normalization)
+    lib_sizes = np.array(X_norm.sum(axis=1)).flatten()
+    size_factors = lib_sizes / np.median(lib_sizes)
 
-    # Variable gene selection - improved to better match R's modelGeneVar
+    # Normalize and log transform
+    for i in range(adata_temp.n_obs):
+        if size_factors[i] > 0:
+            X_norm[i, :] = np.log2(X_norm[i, :] / size_factors[i] + 1)
+
+    # Variable gene selection
     if adata_temp.n_vars <= var_genes:
         top_var_genes = np.arange(adata_temp.n_vars)
     else:
-        # Calculate mean-variance relationship more like R's modelGeneVar
+        # Calculate variance for each gene
         gene_means = np.mean(X_norm, axis=0)
         gene_vars = np.var(X_norm, axis=0)
 
-        # Fit a trend between mean and variance (simplified version of R's approach)
-        # R uses a more sophisticated trend fitting, but this approximation is closer
-        from scipy.interpolate import UnivariateSpline
+        # Simple variance ranking (R uses more sophisticated modelGeneVar)
+        top_var_genes = np.argsort(gene_vars)[::-1][:var_genes]
 
-        # Sort by mean for fitting
-        sorted_idx = np.argsort(gene_means)
-        sorted_means = gene_means[sorted_idx]
-        sorted_vars = gene_vars[sorted_idx]
-
-        # Fit spline to estimate technical variance
-        # Use fewer knots for small datasets
-        n_knots = min(5, len(sorted_means) // 10)
-        if n_knots >= 3 and len(sorted_means) > 10:
-            try:
-                spline = UnivariateSpline(sorted_means, sorted_vars, k=3, s=len(sorted_means))
-                tech_var = spline(gene_means)
-                tech_var = np.maximum(tech_var, 0.001)  # Ensure positive
-            except:
-                # Fallback to simple linear relationship
-                tech_var = gene_means * 0.1 + 0.01
-        else:
-            # Simple technical variance model for small datasets
-            tech_var = gene_means * 0.1 + 0.01
-
-        # Biological variance = total variance - technical variance
-        bio_var = np.maximum(gene_vars - tech_var, 0)
-
-        # Select top variable genes by biological variance
-        top_var_genes = np.argsort(bio_var)[::-1][:var_genes]
-
-    # Filter to variable genes
     counts_filtered = X_norm[:, top_var_genes]
 
-    # CRITICAL: Use normalized counts DIRECTLY for UMAP (no PCA!)
-    # Ensure we have enough neighbors
+    # UMAP with R parameters
     n_neighbors = min(15, counts_filtered.shape[0] - 1)
 
-    # UMAP with EXACT R parameters
     import umap
     reducer = umap.UMAP(
         n_neighbors=n_neighbors,
@@ -317,81 +288,55 @@ def decontx_initialize_z_exact(
         n_components=2,
         random_state=seed,
         metric='euclidean',
-        n_epochs=None,  # Let UMAP decide
         learning_rate=1.0,
-        init='spectral',
-        negative_sample_rate=5,
-        transform_queue_size=4.0,
-        a=None,
-        b=None
+        init='spectral'
     )
 
-    # Apply UMAP directly to normalized, filtered counts
     umap_coords = reducer.fit_transform(counts_filtered)
 
     z = None
     if estimate_cell_types:
-        # DBSCAN with EXACT R adaptive algorithm
+        # DBSCAN with adaptive epsilon exactly like R
         from sklearn.cluster import DBSCAN, KMeans
 
         total_clusters = 0
         eps = dbscan_eps
-        iteration = 0
         max_iterations = 10
-        best_result = None
+        iteration = 0
 
         while total_clusters <= 1 and eps > 0 and iteration < max_iterations:
-            # Use min_samples=5 to match R's default
             clusterer = DBSCAN(eps=eps, min_samples=5)
             cluster_labels = clusterer.fit_predict(umap_coords)
 
-            # Count non-noise clusters (exclude -1)
-            unique_labels = np.unique(cluster_labels)
-            non_noise_labels = unique_labels[unique_labels >= 0]
-            total_clusters = len(non_noise_labels)
+            non_noise = cluster_labels[cluster_labels >= 0]
+            total_clusters = len(np.unique(non_noise)) if len(non_noise) > 0 else 0
 
             if total_clusters > 1:
-                best_result = cluster_labels
                 break
 
-            # Store best single cluster result as fallback
-            if total_clusters == 1 and best_result is None:
-                best_result = cluster_labels
-
-            # R's exact eps reduction: 25% reduction each iteration
-            eps = eps * 0.75
+            eps *= 0.75  # R's exact reduction
             iteration += 1
 
-        # Fallback to k-means if DBSCAN fails
+        # Fallback to kmeans
         if total_clusters <= 1:
             kmeans = KMeans(n_clusters=2, random_state=seed, n_init=10)
             cluster_labels = kmeans.fit_predict(umap_coords)
-        else:
-            cluster_labels = best_result
 
-        # Handle noise points (-1) by assigning to nearest cluster
-        if -1 in cluster_labels:
-            noise_mask = cluster_labels == -1
-            if noise_mask.any():
-                # Find nearest non-noise point for each noise point
-                non_noise_mask = ~noise_mask
-                if non_noise_mask.any():
-                    from sklearn.neighbors import NearestNeighbors
-                    nn = NearestNeighbors(n_neighbors=1)
-                    nn.fit(umap_coords[non_noise_mask])
+        # Convert to 1-indexed
+        unique_labels = np.unique(cluster_labels[cluster_labels >= 0])
+        label_map = {label: i + 1 for i, label in enumerate(unique_labels)}
 
-                    for idx in np.where(noise_mask)[0]:
-                        _, indices = nn.kneighbors([umap_coords[idx]])
-                        nearest_non_noise_idx = np.where(non_noise_mask)[0][indices[0, 0]]
-                        cluster_labels[idx] = cluster_labels[nearest_non_noise_idx]
-
-        # Convert to sequential 1-indexed labels (R style)
-        unique_labels = np.unique(cluster_labels)
-        label_map = {old: new + 1 for new, old in enumerate(unique_labels)}
-        z = np.array([label_map[x] for x in cluster_labels])
+        z = np.zeros(len(cluster_labels), dtype=int)
+        for i, label in enumerate(cluster_labels):
+            if label >= 0:
+                z[i] = label_map[label]
+            else:
+                # Assign noise to nearest cluster
+                distances = np.sum((umap_coords[i] - umap_coords[cluster_labels >= 0]) ** 2, axis=1)
+                nearest_idx = np.argmin(distances)
+                z[i] = z[np.where(cluster_labels >= 0)[0][nearest_idx]]
 
     return z, umap_coords
-
 
 def _run_decontx(
         X: Union[np.ndarray, csr_matrix],
