@@ -9,6 +9,27 @@ from scipy.sparse import csr_matrix
 from typing import Tuple
 
 
+# Force compilation with dummy data to avoid first-run compilation overhead
+def _precompile_functions():
+    """Precompile Numba functions to avoid runtime compilation."""
+    dummy_counts = np.random.rand(10, 20).astype(np.float64)
+    dummy_z = np.array([1, 1, 2, 2, 3, 3, 1, 2, 3, 1], dtype=np.int32)
+    dummy_theta = np.random.rand(10).astype(np.float64)
+    dummy_phi = np.random.rand(3, 20).astype(np.float64)
+    dummy_eta = np.random.rand(3, 20).astype(np.float64)
+    dummy_delta = np.array([10.0, 10.0])
+    dummy_colsums = dummy_counts.sum(axis=1)
+
+    # Precompile main functions
+    decontx_em_exact(dummy_counts, dummy_colsums, dummy_theta, True,
+                     dummy_eta, dummy_phi, dummy_z, True, dummy_delta, 1e-20)
+    decontx_initialize_exact(dummy_counts, dummy_theta, dummy_z, 1e-20)
+    decontx_log_likelihood_exact(dummy_counts, dummy_theta, dummy_eta,
+                                 dummy_phi, dummy_z, 1e-20)
+    calculate_native_matrix_fast(dummy_counts, dummy_theta, dummy_phi,
+                                 dummy_eta, dummy_z)
+
+
 @jit(nopython=True, parallel=True)
 def col_sum_by_group(X: np.ndarray, groups: np.ndarray, K: int) -> np.ndarray:
     """
@@ -116,7 +137,7 @@ def fast_norm_prop_log(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
     return result
 
 
-@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+@jit(nopython=True, parallel=True, cache=True, fastmath=True, nogil=True)
 def decontx_em_exact(
         counts,
         counts_colsums,
@@ -130,7 +151,7 @@ def decontx_em_exact(
         pseudocount=1e-20
 ):
     """
-    Optimized EM step with parallel processing.
+    Highly optimized EM step with better parallelization.
     """
     n_cells, n_genes = counts.shape
     n_clusters = phi.shape[0]
@@ -138,54 +159,56 @@ def decontx_em_exact(
     # Pre-allocate arrays
     native_counts = np.zeros((n_cells, n_genes), dtype=np.float64)
 
-    # E-step: Parallel over cells
-    for j in prange(n_cells):
+    # E-step: Vectorized as much as possible
+    for j in prange(n_cells):  # Parallel over cells
         cluster_idx = z[j] - 1
         theta_j = theta[j]
         one_minus_theta = 1.0 - theta_j
 
-        for g in range(n_genes):
-            count = counts[j, g]
-            if count > 0:
-                p_native = theta_j * phi[cluster_idx, g]
-                p_contam = one_minus_theta * eta[cluster_idx, g]
-                total = p_native + p_contam + pseudocount
-                native_counts[j, g] = count * (p_native / total)
+        # Vectorized inner loop
+        phi_cluster = phi[cluster_idx, :]
+        eta_cluster = eta[cluster_idx, :]
+        counts_j = counts[j, :]
 
-    # M-step: Update parameters
-    # Update theta
-    for j in prange(n_cells):
-        native_sum = np.sum(native_counts[j, :])
-        if estimate_delta:
-            theta[j] = (native_sum + delta[0]) / (counts_colsums[j] + delta[0] + delta[1])
-        else:
-            theta[j] = native_sum / (counts_colsums[j] + pseudocount)
-        theta[j] = max(1e-10, min(1.0 - 1e-10, theta[j]))
+        # Compute all probabilities at once
+        p_native = theta_j * phi_cluster
+        p_contam = one_minus_theta * eta_cluster
+        p_total = p_native + p_contam + pseudocount
 
-    # Update phi (cluster profiles)
+        # Update native counts
+        native_counts[j, :] = counts_j * (p_native / p_total)
+
+    # M-step: Update theta (vectorized)
+    native_sums = np.sum(native_counts, axis=1)
+    if estimate_delta:
+        theta = (native_sums + delta[0]) / (counts_colsums + delta[0] + delta[1])
+    else:
+        theta = native_sums / (counts_colsums + pseudocount)
+
+    # Clip theta to valid range
+    theta = np.maximum(1e-10, np.minimum(1.0 - 1e-10, theta))
+
+    # Update phi - vectorized per cluster
+    phi_new = np.zeros_like(phi)
     for k in range(n_clusters):
-        cluster_native = np.zeros(n_genes, dtype=np.float64)
-        for j in range(n_cells):
-            if z[j] == k + 1:
-                for g in range(n_genes):
-                    cluster_native[g] += native_counts[j, g]
+        mask = (z == k + 1)
+        if np.any(mask):
+            cluster_native = np.sum(native_counts[mask, :], axis=0)
+            total = np.sum(cluster_native) + n_genes * pseudocount
+            phi_new[k, :] = (cluster_native + pseudocount) / total
+    phi[:] = phi_new
 
-        total = np.sum(cluster_native) + n_genes * pseudocount
-        for g in range(n_genes):
-            phi[k, g] = (cluster_native[g] + pseudocount) / total
-
-    # Update eta if needed
+    # Update eta if needed - vectorized
     if estimate_eta:
+        eta_new = np.zeros_like(eta)
         for k in range(n_clusters):
-            contam_sum = np.zeros(n_genes, dtype=np.float64)
-            for j in range(n_cells):
-                if z[j] == k + 1:
-                    for g in range(n_genes):
-                        contam_sum[g] += counts[j, g] - native_counts[j, g]
-
-            total = np.sum(contam_sum) + n_genes * pseudocount
-            for g in range(n_genes):
-                eta[k, g] = (contam_sum[g] + pseudocount) / total
+            mask = (z == k + 1)
+            if np.any(mask):
+                contam = counts[mask, :] - native_counts[mask, :]
+                contam_sum = np.sum(contam, axis=0)
+                total = np.sum(contam_sum) + n_genes * pseudocount
+                eta_new[k, :] = (contam_sum + pseudocount) / total
+        eta[:] = eta_new
 
     # Update delta if requested
     if estimate_delta:
@@ -563,3 +586,7 @@ def calculate_log_messages_time():
     # This is simplified - in practice you'd want to use datetime
     # Numba doesn't support datetime directly
     return 0.0  # Placeholder for timestamp
+
+
+# Call precompilation when module loads
+_precompile_functions()
