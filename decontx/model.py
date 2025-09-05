@@ -50,21 +50,23 @@ class DecontXModel:
 
     def _r_exact_initialization(self, X, z, theta, pseudocount=1e-20):
         """
-        CORRECTED: Use the fixed initialization that properly calculates eta.
+        CORRECTED: Ensure we're using the fixed initialization.
         """
-        # Ensure proper data types
+        # Ensure proper data types and contiguity
         if issparse(X):
             X = X.toarray()
         X = np.ascontiguousarray(X, dtype=np.float64)
         z = np.ascontiguousarray(z, dtype=np.int32)
         theta = np.ascontiguousarray(theta, dtype=np.float64)
 
-        # Call the corrected initialization
-        return decontx_initialize_exact(X, theta, z, pseudocount)
+        # Use the corrected initialization function
+        phi, eta = decontx_initialize_exact(X, theta, z, pseudocount)
+
+        return phi, eta
 
     def fit_transform(self, X, z, X_background=None):
         """
-        Optimized fit using compiled functions.
+        CORRECTED: Better theta initialization to match R.
         """
         np.random.seed(self.seed)
 
@@ -72,19 +74,22 @@ class DecontXModel:
         if issparse(X):
             X = X.toarray()
 
-        # Ensure proper types
+        # Ensure proper types and contiguity
         X = np.ascontiguousarray(X, dtype=np.float64)
         z = np.ascontiguousarray(z, dtype=np.int32)
 
         n_cells, n_genes = X.shape
         n_clusters = len(np.unique(z))
 
-        # Initialize
-        from scipy.stats import beta
-        theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.seed)
+        # Initialize theta from Beta distribution
+        # R uses shape1=delta[0], shape2=delta[1] for native proportion
+        theta = np.random.beta(self.delta[0], self.delta[1], size=n_cells)
+
+        # Ensure theta is in valid range
+        theta = np.clip(theta, 1e-10, 1 - 1e-10)
         theta = np.ascontiguousarray(theta, dtype=np.float64)
 
-        # Use initialization (now the method exists again)
+        # Use corrected initialization
         phi, eta = self._r_exact_initialization(X, z, theta)
 
         # Handle background if provided

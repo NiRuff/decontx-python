@@ -196,15 +196,15 @@ def _process_clusters(
         seed: int,
         log
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Updated cluster processing with exact R initialization."""
+    """CORRECTED: Skip UMAP calculation when clusters are provided."""
 
     umap_coords = None
 
     if z is None:
         log(".. Generating UMAP and estimating cell types")
-        # Use EXACT R initialization with corrected defaults
+        # Only calculate UMAP when we need to generate clusters
         z_labels, umap_coords = decontx_initialize_z_exact(
-            adata, var_genes=var_genes, dbscan_eps=dbscan_eps, seed=seed  # Use actual parameters
+            adata, var_genes=var_genes, dbscan_eps=dbscan_eps, seed=seed
         )
         n_clusters = len(np.unique(z_labels))
         log(f".... Generated {n_clusters} clusters using DBSCAN (eps={dbscan_eps})")
@@ -215,9 +215,12 @@ def _process_clusters(
     elif isinstance(z, str):
         log(f".. Using provided cluster labels from '{z}'")
         z_labels = adata.obs[z].values
+        # NO UMAP calculation when clusters are provided!
+
     else:
         log(".. Using provided cluster labels")
         z_labels = np.asarray(z)
+        # NO UMAP calculation when clusters are provided!
 
     # Process labels with R-style validation
     z_labels = _process_cell_labels(z_labels, adata.n_obs)
@@ -229,7 +232,6 @@ def _process_clusters(
         raise ValueError("Need at least 2 clusters for decontamination")
 
     return z_labels, umap_coords
-
 
 def decontx_initialize_z_exact(
         adata,
