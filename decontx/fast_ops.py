@@ -137,7 +137,7 @@ def fast_norm_prop_log(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
     return result
 
 
-@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def decontx_em_exact(
         counts,
         counts_colsums,
@@ -152,39 +152,37 @@ def decontx_em_exact(
 ):
     """
     CORRECTED & OPTIMIZED: Fast EM step with R-equivalent logic.
+    Removed problematic parallelization to avoid compilation errors.
     """
     n_cells, n_genes = counts.shape
     n_clusters = phi.shape[0]
 
-    # E-step: Parallel calculation of expected native counts
+    # E-step: Calculate expected native counts
     native_counts = np.zeros((n_cells, n_genes), dtype=np.float64)
 
-    for j in prange(n_cells):
+    for j in range(n_cells):  # Sequential for stability
         cluster_idx = z[j] - 1
         theta_j = theta[j]
         one_minus_theta = 1.0 - theta_j
 
-        # Vectorized calculation for all genes at once
         phi_vec = phi[cluster_idx, :]
         eta_vec = eta[cluster_idx, :]
-        counts_j = counts[j, :]
 
-        # Use stable computation
-        for g in range(n_genes):
-            if counts_j[g] > 0:
-                # More stable computation using log-sum-exp trick
-                p_native = theta_j * phi_vec[g]
-                p_contam = one_minus_theta * eta_vec[g]
-                total = p_native + p_contam + pseudocount
-                native_counts[j, g] = counts_j[g] * p_native / total
+        # Vectorized calculation for all genes
+        p_native = theta_j * phi_vec + pseudocount
+        p_contam = one_minus_theta * eta_vec + pseudocount
+        total = p_native + p_contam
+
+        # Element-wise multiplication and division
+        native_counts[j, :] = counts[j, :] * (p_native / total)
 
     # M-step: Update parameters
 
-    # Vectorized theta update
+    # Update theta
     native_sums = np.sum(native_counts, axis=1)
 
     if estimate_delta:
-        # Vectorized delta estimation
+        # Method of moments for delta
         proportions = native_sums / (counts_colsums + pseudocount)
         mean_prop = np.mean(proportions)
         var_prop = np.var(proportions)
@@ -199,39 +197,32 @@ def decontx_em_exact(
     theta_new = (native_sums + delta[0] - 1) / (counts_colsums + delta[0] + delta[1] - 2)
     theta[:] = np.maximum(pseudocount, np.minimum(1.0 - pseudocount, theta_new))
 
-    # Update phi using optimized accumulation
+    # Update phi
     phi_new = np.zeros_like(phi)
-    cluster_native_totals = np.zeros(n_clusters)
-
-    # First pass: accumulate native counts per cluster
     for k in range(n_clusters):
         mask = (z == k + 1)
-        cluster_native = np.zeros(n_genes)
-        for j in range(n_cells):
-            if mask[j]:
-                cluster_native += native_counts[j, :]
-        cluster_native_totals[k] = np.sum(cluster_native) + n_genes * pseudocount
-        phi_new[k, :] = (cluster_native + pseudocount) / cluster_native_totals[k]
+        if np.any(mask):
+            cluster_native = np.sum(native_counts[mask, :], axis=0)
+            total = np.sum(cluster_native) + n_genes * pseudocount
+            phi_new[k, :] = (cluster_native + pseudocount) / total
 
     phi[:] = phi_new
 
-    # Update eta if needed (contamination FROM other clusters)
+    # Update eta if needed
     if estimate_eta:
         eta_new = np.zeros_like(eta)
-        contam_counts_all = counts - native_counts  # Vectorized subtraction
+        contam_counts = counts - native_counts
 
         for k in range(n_clusters):
-            mask = (z != k + 1)  # FROM OTHER clusters
-            eta_counts = np.zeros(n_genes)
-            for j in range(n_cells):
-                if mask[j]:
-                    eta_counts += contam_counts_all[j, :]
+            other_mask = (z != k + 1)  # FROM OTHER clusters
+            if np.any(other_mask):
+                eta_counts = np.sum(contam_counts[other_mask, :], axis=0)
+                eta_total = np.sum(eta_counts) + n_genes * pseudocount
 
-            eta_total = np.sum(eta_counts) + n_genes * pseudocount
-            if eta_total > n_genes * pseudocount:
-                eta_new[k, :] = (eta_counts + pseudocount) / eta_total
-            else:
-                eta_new[k, :] = 1.0 / n_genes
+                if eta_total > n_genes * pseudocount:
+                    eta_new[k, :] = (eta_counts + pseudocount) / eta_total
+                else:
+                    eta_new[k, :] = 1.0 / n_genes
 
         eta[:] = eta_new
 
@@ -248,27 +239,22 @@ def calculate_native_matrix_fast(
         z: np.ndarray
 ) -> np.ndarray:
     """
-    OPTIMIZED: Fast parallel calculation of native counts.
+    Fast calculation of native counts with safe parallelization.
     """
     n_cells, n_genes = counts.shape
     native_counts = np.zeros_like(counts, dtype=np.float64)
 
+    # Parallelize over cells (independent calculations)
     for j in prange(n_cells):
         cluster = z[j] - 1
         theta_j = theta[j]
-        one_minus_theta = 1.0 - theta_j
 
-        # Vectorized for each cell
-        phi_vec = phi[cluster, :]
-        eta_vec = eta[cluster, :]
-        counts_j = counts[j, :]
+        # Vectorized calculation for this cell
+        p_native = theta_j * phi[cluster, :] + 1e-20
+        p_contam = (1.0 - theta_j) * eta[cluster, :] + 1e-20
+        p_total = p_native + p_contam
 
-        # Compute all genes at once for this cell
-        p_native = theta_j * phi_vec
-        p_contam = one_minus_theta * eta_vec
-        total = p_native + p_contam + 1e-20
-
-        native_counts[j, :] = counts_j * (p_native / total)
+        native_counts[j, :] = counts[j, :] * (p_native / p_total)
 
     return native_counts
 
@@ -318,7 +304,7 @@ def nonzero(X: np.ndarray) -> np.ndarray:
         return np.zeros((0, 2), dtype=np.int64)
 
 
-@jit(nopython=True, parallel=True, cache=True)
+@jit(nopython=True, cache=True)
 def decontx_initialize_exact(
         counts: np.ndarray,
         theta: np.ndarray,
@@ -327,7 +313,7 @@ def decontx_initialize_exact(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     CORRECTED & OPTIMIZED: Exact equivalent of R's decontXInitialize.
-    Uses parallel computation while maintaining R's logic.
+    Note: Can't parallelize cluster accumulation due to data dependencies.
     """
     n_cells, n_genes = counts.shape
     n_clusters = len(np.unique(z))
@@ -336,34 +322,24 @@ def decontx_initialize_exact(
     phi = np.zeros((n_clusters, n_genes))
     eta = np.zeros((n_clusters, n_genes))
 
-    # Parallel computation of weighted counts
-    weighted_native = np.zeros((n_cells, n_genes))
-    weighted_contam = np.zeros((n_cells, n_genes))
+    # Pre-compute weighted counts (vectorized)
+    weighted_native = counts * theta[:, np.newaxis]
+    weighted_contam = counts * (1.0 - theta[:, np.newaxis])
 
-    for j in prange(n_cells):
-        weighted_native[j, :] = counts[j, :] * theta[j]
-        weighted_contam[j, :] = counts[j, :] * (1.0 - theta[j])
-
-    # Calculate phi and eta for each cluster (can't parallelize due to accumulation)
+    # Calculate phi and eta for each cluster
     for k in range(n_clusters):
         cluster_mask = (z == k + 1)
 
         # Phi: native expression for cluster k
-        phi_counts = np.zeros(n_genes)
-        for j in range(n_cells):
-            if cluster_mask[j]:
-                phi_counts += weighted_native[j, :]
-
+        phi_counts = np.sum(weighted_native[cluster_mask, :], axis=0)
         phi_total = np.sum(phi_counts) + n_genes * pseudocount
         phi[k, :] = (phi_counts + pseudocount) / phi_total
 
         # Eta: contamination FROM other clusters
-        eta_counts = np.zeros(n_genes)
-        for j in range(n_cells):
-            if not cluster_mask[j]:  # FROM OTHER clusters
-                eta_counts += weighted_contam[j, :]
-
+        other_mask = ~cluster_mask
+        eta_counts = np.sum(weighted_contam[other_mask, :], axis=0)
         eta_total = np.sum(eta_counts) + n_genes * pseudocount
+
         if eta_total > n_genes * pseudocount:
             eta[k, :] = (eta_counts + pseudocount) / eta_total
         else:
@@ -372,7 +348,7 @@ def decontx_initialize_exact(
     return phi, eta
 
 
-@jit(nopython=True, parallel=True, cache=True)
+@jit(nopython=True, cache=True)
 def decontx_log_likelihood_exact(
         counts: np.ndarray,
         theta: np.ndarray,
@@ -382,29 +358,26 @@ def decontx_log_likelihood_exact(
         pseudocount: float = 1e-20
 ) -> float:
     """
-    OPTIMIZED: Parallel log-likelihood calculation.
+    Sequential log-likelihood calculation to avoid compilation issues.
+    Still fast due to vectorization within each cell.
     """
-    n_cells = counts.shape[0]
-    log_lik_per_cell = np.zeros(n_cells)
+    n_cells, n_genes = counts.shape
+    log_likelihood = 0.0
 
-    for j in prange(n_cells):
+    for j in range(n_cells):
         cluster_idx = z[j] - 1
-        cell_ll = 0.0
 
-        theta_j = theta[j]
-        phi_vec = phi[cluster_idx, :]
-        eta_vec = eta[cluster_idx, :]
-        counts_j = counts[j, :]
+        # Vectorized calculation for all genes in this cell
+        mixture_probs = (theta[j] * phi[cluster_idx, :] +
+                         (1.0 - theta[j]) * eta[cluster_idx, :] +
+                         pseudocount)
 
-        # Vectorized calculation per cell
-        for g in range(counts.shape[1]):
-            if counts_j[g] > 0:
-                mixture_prob = theta_j * phi_vec[g] + (1 - theta_j) * eta_vec[g] + pseudocount
-                cell_ll += counts_j[g] * np.log(mixture_prob)
+        # Only sum where counts > 0
+        mask = counts[j, :] > 0
+        if np.any(mask):
+            log_likelihood += np.sum(counts[j, mask] * np.log(mixture_probs[mask]))
 
-        log_lik_per_cell[j] = cell_ll
-
-    return np.sum(log_lik_per_cell)
+    return log_likelihood
 
 @jit(nopython=True, parallel=True)
 def fast_norm_prop_sqrt(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
