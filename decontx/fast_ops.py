@@ -116,105 +116,90 @@ def fast_norm_prop_log(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
     return result
 
 
-@jit(nopython=True, parallel=True)
+@jit(nopython=True, parallel=True, cache=True, fastmath=True)
 def decontx_em_exact(
-        counts: np.ndarray,
-        counts_colsums: np.ndarray,
-        theta: np.ndarray,
-        estimate_eta: bool,
-        eta: np.ndarray,
-        phi: np.ndarray,
-        z: np.ndarray,
-        estimate_delta: bool,
-        delta: np.ndarray,
-        pseudocount: float = 1e-20
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        counts,
+        counts_colsums,
+        theta,
+        estimate_eta,
+        eta,
+        phi,
+        z,
+        estimate_delta,
+        delta,
+        pseudocount=1e-20
+):
     """
-    Exact equivalent of R's decontXEM function.
-
-    This matches the C++ implementation in R exactly.
+    Optimized EM step with parallel processing.
     """
     n_cells, n_genes = counts.shape
     n_clusters = phi.shape[0]
 
-    # E-step: Calculate posterior probabilities
-    log_phi = np.log(phi + pseudocount)
-    log_eta = np.log(eta + pseudocount)
-    log_theta = np.log(theta + pseudocount)
-    log_one_minus_theta = np.log(1.0 - theta + pseudocount)
+    # Pre-allocate arrays
+    native_counts = np.zeros((n_cells, n_genes), dtype=np.float64)
 
-    # Calculate responsibilities for each transcript
-    estRmat = np.zeros_like(counts, dtype=np.float64)
-
+    # E-step: Parallel over cells
     for j in prange(n_cells):
-        cluster_idx = z[j] - 1  # Convert to 0-indexed
+        cluster_idx = z[j] - 1
+        theta_j = theta[j]
+        one_minus_theta = 1.0 - theta_j
+
         for g in range(n_genes):
-            if counts[j, g] > 0:
-                log_native = log_phi[cluster_idx, g] + log_theta[j]
-                log_contam = log_eta[cluster_idx, g] + log_one_minus_theta[j]
-
-                # Numerically stable computation
-                max_val = max(log_native, log_contam)
-                exp_native = np.exp(log_native - max_val)
-                exp_contam = np.exp(log_contam - max_val)
-
-                p_native = exp_native / (exp_native + exp_contam)
-                estRmat[j, g] = counts[j, g] * p_native
+            count = counts[j, g]
+            if count > 0:
+                p_native = theta_j * phi[cluster_idx, g]
+                p_contam = one_minus_theta * eta[cluster_idx, g]
+                total = p_native + p_contam + pseudocount
+                native_counts[j, g] = count * (p_native / total)
 
     # M-step: Update parameters
     # Update theta
-    estRmat_colsums = np.zeros(n_cells)
-    for j in range(n_cells):
-        estRmat_colsums[j] = np.sum(estRmat[j, :])
+    for j in prange(n_cells):
+        native_sum = np.sum(native_counts[j, :])
+        if estimate_delta:
+            theta[j] = (native_sum + delta[0]) / (counts_colsums[j] + delta[0] + delta[1])
+        else:
+            theta[j] = native_sum / (counts_colsums[j] + pseudocount)
+        theta[j] = max(1e-10, min(1.0 - 1e-10, theta[j]))
 
-    new_theta = (estRmat_colsums + delta[0]) / (counts_colsums + delta[0] + delta[1])
-
-    # Update phi (native expression)
-    new_phi = np.zeros_like(phi)
+    # Update phi (cluster profiles)
     for k in range(n_clusters):
-        cluster_sum = np.zeros(n_genes)
+        cluster_native = np.zeros(n_genes, dtype=np.float64)
         for j in range(n_cells):
-            if z[j] - 1 == k:
-                cluster_sum += estRmat[j, :]
+            if z[j] == k + 1:
+                for g in range(n_genes):
+                    cluster_native[g] += native_counts[j, g]
 
-        phi_sum = np.sum(cluster_sum) + n_genes * pseudocount
+        total = np.sum(cluster_native) + n_genes * pseudocount
         for g in range(n_genes):
-            new_phi[k, g] = (cluster_sum[g] + pseudocount) / phi_sum
+            phi[k, g] = (cluster_native[g] + pseudocount) / total
 
-    # Update eta (contamination) if needed
-    new_eta = eta.copy()
+    # Update eta if needed
     if estimate_eta:
         for k in range(n_clusters):
-            contam_sum = np.zeros(n_genes)
+            contam_sum = np.zeros(n_genes, dtype=np.float64)
             for j in range(n_cells):
-                if z[j] - 1 != k:  # From other clusters
-                    contam_sum += (counts[j, :] - estRmat[j, :])
+                if z[j] == k + 1:
+                    for g in range(n_genes):
+                        contam_sum[g] += counts[j, g] - native_counts[j, g]
 
-            eta_sum = np.sum(contam_sum) + n_genes * pseudocount
+            total = np.sum(contam_sum) + n_genes * pseudocount
             for g in range(n_genes):
-                new_eta[k, g] = (contam_sum[g] + pseudocount) / eta_sum
+                eta[k, g] = (contam_sum[g] + pseudocount) / total
 
     # Update delta if requested
-    new_delta = delta.copy()
     if estimate_delta:
-        # Method of moments for beta distribution
-        theta_vals = new_theta[np.isfinite(new_theta)]
-        theta_vals = np.clip(theta_vals, pseudocount, 1.0 - pseudocount)
+        mean_theta = np.mean(theta)
+        var_theta = np.var(theta)
+        if var_theta > 0 and var_theta < mean_theta * (1 - mean_theta):
+            common = mean_theta * (1 - mean_theta) / var_theta - 1
+            if common > 0:
+                delta[0] = mean_theta * common
+                delta[1] = (1 - mean_theta) * common
 
-        if len(theta_vals) > 1:
-            mean_theta = np.mean(theta_vals)
-            var_theta = np.var(theta_vals)
+    contamination = 1.0 - theta
 
-            if var_theta > 0 and var_theta < mean_theta * (1 - mean_theta):
-                common = mean_theta * (1 - mean_theta) / var_theta - 1
-                if common > 0:
-                    new_delta[0] = mean_theta * common
-                    new_delta[1] = (1 - mean_theta) * common
-
-    # Calculate contamination
-    contamination = 1.0 - new_theta
-
-    return new_theta, new_phi, new_eta, new_delta, contamination
+    return theta, phi, eta, delta, contamination
 
 
 @jit(nopython=True, parallel=True)
