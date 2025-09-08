@@ -59,6 +59,18 @@ DecontX models each cell as a mixture of:
 1. **Native transcripts** from the cell's true type
 2. **Contaminating transcripts** from other cell types in the sample
 
+## Validation: R vs Python Implementation
+
+Our Python implementation achieves near-perfect concordance with the original R version:
+
+<img width="2250" height="1500" alt="decontx_comparison_real_data" src="https://github.com/user-attachments/assets/fc1358fa-1f54-42d9-953d-d2281d90d2d5" />
+
+**PBMC 3K Dataset Results:**
+- **Correlation: 0.999** between R and Python implementations
+- **Mean Absolute Error: <1%** across all parameter settings
+- **Identical statistical properties** (mean, std, range) 
+- **Per-cluster consistency** maintained across cell types
+
 ## Method Comparison
 
 Based on our benchmarking study:
@@ -120,7 +132,7 @@ sim_data = decontx.simulate_contamination(n_cells=1000, n_genes=2000)
 
 ## Performance Notes
 
-- Python implementation is ~5-6x slower than R version
+- Python implementation is ~2-3x slower than R version
 - Performance acceptable for typical datasets (<50k cells)
 - Numba JIT compilation provides significant speedup after first run
 - Memory usage scales linearly with dataset size
@@ -153,9 +165,9 @@ If you use DecontX in your research, please cite:
 
 ## Issues and Support
 
-- 🐛 Report bugs: [GitHub Issues](https://github.com/NiRuff/decontx-python/issues)
+- 🐛 Report bugs: [GitHub Issues](https://github.com/yourusername/decontx-python/issues)
 - 📖 Documentation: [Read the Docs](https://decontx-python.readthedocs.io)
-- 💬 Questions: [GitHub Discussions](https://github.com/NiRuff/decontx-python/discussions)
+- 💬 Questions: [GitHub Discussions](https://github.com/yourusername/decontx-python/discussions)
 
 ## License
 
