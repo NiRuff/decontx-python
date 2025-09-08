@@ -151,101 +151,83 @@ def decontx_em_exact(
         pseudocount=1e-20
 ):
     """
-    CORRECTED: More precise EM step matching R's exact algorithm.
+    FIXED: Correct EM step matching R's decontXEM exactly.
+    Critical fix: eta calculation was completely wrong.
     """
     n_cells, n_genes = counts.shape
     n_clusters = phi.shape[0]
 
-    # E-step: Calculate posterior probability of native expression
+    # E-step: Calculate expected native counts
     native_counts = np.zeros((n_cells, n_genes), dtype=np.float64)
 
     for j in range(n_cells):
         cluster_idx = z[j] - 1
+        theta_j = theta[j]
 
+        # Calculate posterior probability that each count is native
         for g in range(n_genes):
             if counts[j, g] > 0:
-                # Probability of being native
-                p_native = theta[j] * phi[cluster_idx, g]
-                # Probability of being contamination
-                p_contam = (1.0 - theta[j]) * eta[cluster_idx, g]
+                # P(native) = theta * phi / (theta * phi + (1-theta) * eta)
+                p_native = theta_j * phi[cluster_idx, g]
+                p_contam = (1.0 - theta_j) * eta[cluster_idx, g]
 
-                # Posterior probability this count is native
-                posterior_native = p_native / (p_native + p_contam + pseudocount)
-
-                # Expected native counts
-                native_counts[j, g] = counts[j, g] * posterior_native
+                # Avoid division by zero
+                total = p_native + p_contam + pseudocount
+                native_counts[j, g] = counts[j, g] * (p_native + pseudocount) / total
 
     # M-step: Update parameters
 
-    # Update theta (proportion of native counts)
-    for j in range(n_cells):
-        native_sum = np.sum(native_counts[j, :])
-        total_count = counts_colsums[j]
+    # Update theta
+    native_sums = np.sum(native_counts, axis=1)
 
-        if estimate_delta:
-            # With delta estimation - use prior
-            theta[j] = (native_sum + delta[0] - 1) / (total_count + delta[0] + delta[1] - 2)
-        else:
-            # Without delta estimation
-            theta[j] = (native_sum + delta[0]) / (total_count + sum(delta))
-
-        # Ensure theta stays in valid range
-        theta[j] = max(pseudocount, min(1.0 - pseudocount, theta[j]))
-
-    # Update delta if requested (using method of moments)
     if estimate_delta:
-        theta_mean = np.mean(theta)
-        theta_var = np.var(theta)
+        # Simple moment matching for delta
+        proportions = native_sums / (counts_colsums + pseudocount)
+        mean_prop = np.mean(proportions)
+        var_prop = np.var(proportions)
 
-        if theta_var > 0 and theta_var < theta_mean * (1 - theta_mean):
-            # Method of moments estimation
-            common_factor = (theta_mean * (1 - theta_mean) / theta_var) - 1
-            if common_factor > 0:
-                delta[0] = theta_mean * common_factor
-                delta[1] = (1 - theta_mean) * common_factor
+        if var_prop > 0 and var_prop < mean_prop * (1 - mean_prop):
+            precision = (mean_prop * (1 - mean_prop) / var_prop - 1)
+            delta[0] = mean_prop * precision
+            delta[1] = (1 - mean_prop) * precision
+            # Bound delta values
+            delta[0] = max(0.1, min(1000.0, delta[0]))
+            delta[1] = max(0.1, min(1000.0, delta[1]))
 
-                # Keep delta in reasonable range
-                delta[0] = max(0.1, min(1000.0, delta[0]))
-                delta[1] = max(0.1, min(1000.0, delta[1]))
+    # Update theta with beta posterior
+    theta_new = (native_sums + delta[0] - 1) / (counts_colsums + delta[0] + delta[1] - 2)
+    theta[:] = np.maximum(pseudocount, np.minimum(1.0 - pseudocount, theta_new))
 
-    # Update phi (native expression distribution)
+    # Update phi (expression distribution for each cluster)
+    phi_new = np.zeros_like(phi)
     for k in range(n_clusters):
-        cluster_cells = (z == k + 1)
-        cluster_native = np.zeros(n_genes)
+        mask = (z == k + 1)
+        if np.any(mask):
+            # Sum native counts for this cluster
+            cluster_native = np.sum(native_counts[mask, :], axis=0)
+            total = np.sum(cluster_native) + n_genes * pseudocount
+            phi_new[k, :] = (cluster_native + pseudocount) / total
 
-        for j in range(n_cells):
-            if z[j] == k + 1:
-                for g in range(n_genes):
-                    cluster_native[g] += native_counts[j, g]
+    phi[:] = phi_new
 
-        # Normalize
-        total = np.sum(cluster_native) + n_genes * pseudocount
-        for g in range(n_genes):
-            phi[k, g] = (cluster_native[g] + pseudocount) / total
-
-    # Update eta if needed (contamination distribution)
+    # Update eta (contamination distribution) - CRITICAL FIX
     if estimate_eta:
+        eta_new = np.zeros_like(eta)
+
         for k in range(n_clusters):
-            # Contamination in cluster k comes from OTHER clusters
-            eta_counts = np.zeros(n_genes)
-
-            for j in range(n_cells):
-                if z[j] != k + 1:  # Only cells NOT in cluster k
-                    contam_weight = counts_colsums[j] - np.sum(native_counts[j, :])
-                    if contam_weight > 0:
-                        # Distribute contamination proportionally
-                        for g in range(n_genes):
-                            if counts[j, g] > 0:
-                                eta_counts[g] += (counts[j, g] - native_counts[j, g])
-
-            # Normalize
-            eta_total = np.sum(eta_counts) + n_genes * pseudocount
-            if eta_total > n_genes * pseudocount:
-                for g in range(n_genes):
-                    eta[k, g] = (eta_counts[g] + pseudocount) / eta_total
+            # CRITICAL: eta[k] should be based on NATIVE expression from OTHER clusters
+            # Not contamination from other clusters!
+            other_mask = (z != k + 1)
+            if np.any(other_mask):
+                # Sum NATIVE counts from OTHER clusters
+                other_native = np.sum(native_counts[other_mask, :], axis=0)
+                total = np.sum(other_native) + n_genes * pseudocount
+                eta_new[k, :] = (other_native + pseudocount) / total
             else:
-                for g in range(n_genes):
-                    eta[k, g] = 1.0 / n_genes
+                # If no other clusters, uniform distribution
+                eta_new[k, :] = 1.0 / n_genes
+
+        eta[:] = eta_new
 
     contamination = 1.0 - theta
     return theta, phi, eta, delta, contamination
@@ -333,55 +315,41 @@ def decontx_initialize_exact(
         pseudocount: float = 1e-20
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    CORRECTED: Match R's exact initialization logic.
-    Eta should be contamination FROM other clusters, not including current cluster.
+    FIXED: Initialize phi and eta exactly as R does.
+    Critical: eta should be based on expression FROM other clusters.
     """
     n_cells, n_genes = counts.shape
     n_clusters = len(np.unique(z))
 
-    # Pre-allocate
     phi = np.zeros((n_clusters, n_genes))
     eta = np.zeros((n_clusters, n_genes))
 
-    # Calculate native expression for each cluster (phi)
+    # Weight counts by initial theta
+    weighted_native = counts * theta[:, np.newaxis]
+    weighted_contam = counts * (1.0 - theta[:, np.newaxis])
+
+    # Calculate phi and eta for each cluster
     for k in range(n_clusters):
         cluster_mask = (z == k + 1)
-        n_cells_in_cluster = np.sum(cluster_mask)
 
-        if n_cells_in_cluster > 0:
-            # Native counts for this cluster (weighted by theta)
-            native_counts = np.zeros(n_genes)
-            for j in range(n_cells):
-                if z[j] == k + 1:
-                    for g in range(n_genes):
-                        native_counts[g] += counts[j, g] * theta[j]
-
-            # Normalize to get phi
-            phi_total = np.sum(native_counts) + n_genes * pseudocount
-            for g in range(n_genes):
-                phi[k, g] = (native_counts[g] + pseudocount) / phi_total
-
-    # Calculate contamination distribution for each cluster (eta)
-    # CRITICAL: This should be from OTHER clusters only!
-    for k in range(n_clusters):
-        # Sum contamination from ALL OTHER clusters
-        contam_counts = np.zeros(n_genes)
-
-        for j in range(n_cells):
-            if z[j] != k + 1:  # ONLY cells NOT in cluster k
-                contamination_weight = 1.0 - theta[j]
-                for g in range(n_genes):
-                    contam_counts[g] += counts[j, g] * contamination_weight
-
-        # Normalize
-        eta_total = np.sum(contam_counts) + n_genes * pseudocount
-        if eta_total > n_genes * pseudocount:
-            for g in range(n_genes):
-                eta[k, g] = (contam_counts[g] + pseudocount) / eta_total
+        # Phi: native expression for cluster k
+        if np.any(cluster_mask):
+            phi_counts = np.sum(weighted_native[cluster_mask, :], axis=0)
+            phi_total = np.sum(phi_counts) + n_genes * pseudocount
+            phi[k, :] = (phi_counts + pseudocount) / phi_total
         else:
-            # Uniform distribution if no contamination
-            for g in range(n_genes):
-                eta[k, g] = 1.0 / n_genes
+            phi[k, :] = 1.0 / n_genes
+
+        # Eta: contamination INTO cluster k FROM other clusters
+        # This should be based on NATIVE expression from OTHER clusters
+        other_mask = ~cluster_mask
+        if np.any(other_mask):
+            # Use NATIVE counts from OTHER clusters
+            eta_counts = np.sum(weighted_native[other_mask, :], axis=0)
+            eta_total = np.sum(eta_counts) + n_genes * pseudocount
+            eta[k, :] = (eta_counts + pseudocount) / eta_total
+        else:
+            eta[k, :] = 1.0 / n_genes
 
     return phi, eta
 
