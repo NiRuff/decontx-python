@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Union, Tuple
 from anndata import AnnData
-from scipy.sparse import issparse
+from scipy.sparse import issparse, csr_matrix, vstack
 import warnings
 from datetime import datetime
 
@@ -92,9 +92,9 @@ def decontx(
     start_time = datetime.now()
 
     if verbose:
-        print("=" * 50)
-        print("Starting DecontX")
-        print("=" * 50)
+        print("=" * 50, flush=True)
+        print("Starting DecontX", flush=True)
+        print("=" * 50, flush=True)
 
     # Input validation
     _validate_inputs(adata, cluster_key, batch_key)
@@ -108,8 +108,8 @@ def decontx(
 
     if verbose:
         n_clusters = len(np.unique(z_labels))
-        print(f"Processing {adata.n_obs} cells, {adata.n_vars} genes")
-        print(f"Using {n_clusters} clusters from '{cluster_key}'")
+        print(f"Processing {adata.n_obs} cells, {adata.n_vars} genes", flush=True)
+        print(f"Using {n_clusters} clusters from '{cluster_key}'", flush=True)
 
     # Process batches if specified
     if batch_key is not None:
@@ -120,7 +120,7 @@ def decontx(
         unique_batches = np.unique(batch_labels)
 
         if verbose:
-            print(f"Processing {len(unique_batches)} batches separately")
+            print(f"Processing {len(unique_batches)} batches separately", flush=True)
 
         results = _process_batches(
             adata, z_labels, batch_labels, unique_batches,
@@ -129,7 +129,7 @@ def decontx(
     else:
         # Single batch processing
         if verbose:
-            print("Processing as single batch")
+            print("Processing as single batch", flush=True)
 
         result = _run_decontx_single(
             adata.X, z_labels, max_iter, delta, estimate_delta,
@@ -140,18 +140,22 @@ def decontx(
     # Store results
     _store_results(adata, results, z_labels, cluster_key, batch_key)
 
+    # Use fitted delta (may differ from input when estimate_delta=True)
+    first_result = results.get("all") or next(iter(results.values()))
+    fitted_delta = first_result.get("delta", delta)
+
     # Store metadata
-    _store_metadata(adata, delta, estimate_delta, max_iter, convergence, seed, start_time)
+    _store_metadata(adata, fitted_delta, estimate_delta, max_iter, convergence, seed, start_time)
 
     if verbose:
         contamination = adata.obs['decontX_contamination']
-        print(f"Mean contamination: {contamination.mean():.1%}")
-        print(f"Highly contaminated cells (>50%): {(contamination > 0.5).sum()}")
+        print(f"Mean contamination: {contamination.mean():.1%}", flush=True)
+        print(f"Highly contaminated cells (>50%): {(contamination > 0.5).sum()}", flush=True)
 
         end_time = datetime.now()
-        print("=" * 50)
-        print(f"Completed DecontX in {end_time - start_time}")
-        print("=" * 50)
+        print("=" * 50, flush=True)
+        print(f"Completed DecontX in {end_time - start_time}", flush=True)
+        print("=" * 50, flush=True)
 
     if copy:
         return adata
@@ -225,7 +229,7 @@ def _process_batches(
 
     for batch in unique_batches:
         if verbose:
-            print(f"  Processing batch '{batch}'...")
+            print(f"  Processing batch '{batch}'...", flush=True)
 
         # Get batch data
         batch_mask = batch_labels == batch
@@ -251,7 +255,7 @@ def _process_batches(
 
         if verbose:
             contamination = result['contamination']
-            print(f"    Mean contamination: {contamination.mean():.1%}")
+            print(f"    Mean contamination: {contamination.mean():.1%}", flush=True)
 
     return batch_results
 
@@ -294,20 +298,33 @@ def _store_results(
     n_genes = adata.n_vars
 
     if len(results) == 1 and "all" in results:
-        # Single batch
+        # Single batch — store sparse result directly
         result = results["all"]
         adata.layers['decontX_counts'] = result['decontaminated_counts']
         adata.obs['decontX_contamination'] = result['contamination']
     else:
-        # Multiple batches - combine results
-        decontx_counts = np.zeros((n_cells, n_genes))
+        # Multiple batches — stack sparse matrices in cell order
         contamination = np.zeros(n_cells)
+        batch_matrices = {}
 
         for batch_name, result in results.items():
             if 'batch_indices' in result:
                 batch_indices = result['batch_indices']
-                decontx_counts[batch_indices] = result['decontaminated_counts']
+                batch_matrices[batch_name] = (
+                    batch_indices, result['decontaminated_counts']
+                )
                 contamination[batch_indices] = result['contamination']
+
+        # Build ordered list of per-batch matrices with index tracking
+        ordered = sorted(batch_matrices.values(), key=lambda x: x[0][0])
+        if ordered:
+            stacked = vstack([m for _, m in ordered], format='csr')
+            # Reorder rows to match original cell indices
+            all_indices = np.concatenate([idx for idx, _ in ordered])
+            inv_perm = np.argsort(all_indices)
+            decontx_counts = stacked[inv_perm]
+        else:
+            decontx_counts = csr_matrix((n_cells, n_genes))
 
         adata.layers['decontX_counts'] = decontx_counts
         adata.obs['decontX_contamination'] = contamination
@@ -331,7 +348,7 @@ def _store_metadata(
 
     metadata = {
         'parameters': {
-            'delta': delta,
+            'delta': list(delta),
             'estimate_delta': estimate_delta,
             'max_iter': max_iter,
             'convergence': convergence,

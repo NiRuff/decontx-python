@@ -12,22 +12,30 @@ from typing import Tuple
 # Force compilation with dummy data to avoid first-run compilation overhead
 def _precompile_functions():
     """Precompile Numba functions to avoid runtime compilation."""
-    dummy_counts = np.random.rand(10, 20).astype(np.float64)
+    from scipy.sparse import csr_matrix as _csr
+    dummy_dense = np.random.rand(10, 20).astype(np.float64)
+    dummy_dense[dummy_dense < 0.5] = 0.0  # make sparse
+    dummy_csr = _csr(dummy_dense)
+    dummy_indptr = dummy_csr.indptr.astype(np.int64)
+    dummy_indices = dummy_csr.indices.astype(np.int64)
+    dummy_data = dummy_csr.data.astype(np.float64)
     dummy_z = np.array([1, 1, 2, 2, 3, 3, 1, 2, 3, 1], dtype=np.int32)
     dummy_theta = np.random.rand(10).astype(np.float64)
     dummy_phi = np.random.rand(3, 20).astype(np.float64)
     dummy_eta = np.random.rand(3, 20).astype(np.float64)
     dummy_delta = np.array([10.0, 10.0])
-    dummy_colsums = dummy_counts.sum(axis=1)
+    dummy_colsums = np.asarray(dummy_csr.sum(axis=1)).ravel().astype(np.float64)
 
-    # Precompile main functions
-    decontx_em_exact(dummy_counts, dummy_colsums, dummy_theta, True,
+    # Precompile main functions with CSR signatures
+    decontx_initialize_exact(dummy_indptr, dummy_indices, dummy_data,
+                             10, 20, dummy_theta, dummy_z, 1e-20)
+    decontx_em_exact(dummy_indptr, dummy_indices, dummy_data, 10, 20,
+                     dummy_colsums, dummy_theta, True,
                      dummy_eta, dummy_phi, dummy_z, True, dummy_delta, 1e-20)
-    decontx_initialize_exact(dummy_counts, dummy_theta, dummy_z, 1e-20)
-    decontx_log_likelihood_exact(dummy_counts, dummy_theta, dummy_eta,
-                                 dummy_phi, dummy_z, 1e-20)
-    calculate_native_matrix_fast(dummy_counts, dummy_theta, dummy_phi,
-                                 dummy_eta, dummy_z)
+    decontx_log_likelihood_exact(dummy_indptr, dummy_indices, dummy_data, 10,
+                                 dummy_theta, dummy_eta, dummy_phi, dummy_z, 1e-20)
+    calculate_native_matrix_fast(dummy_indptr, dummy_indices, dummy_data, 10,
+                                 dummy_theta, dummy_phi, dummy_eta, dummy_z)
 
 
 @jit(nopython=True, parallel=True)
@@ -137,97 +145,111 @@ def fast_norm_prop_log(X: np.ndarray, alpha: float = 1e-10) -> np.ndarray:
     return result
 
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, fastmath=True, cache=True)
 def decontx_em_exact(
-        counts,
-        counts_colsums,
-        theta,
-        estimate_eta,
-        eta,
-        phi,
-        z,
-        estimate_delta,
-        delta,
-        pseudocount=1e-20
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        data: np.ndarray,
+        n_cells: int,
+        n_genes: int,
+        counts_colsums: np.ndarray,
+        theta: np.ndarray,
+        estimate_eta: bool,
+        eta: np.ndarray,
+        phi: np.ndarray,
+        z: np.ndarray,
+        estimate_delta: bool,
+        delta: np.ndarray,
+        pseudocount: float = 1e-20
 ):
     """
-    FIXED: Correct EM step matching R's decontXEM exactly.
-    Critical fix: eta calculation was completely wrong.
+    Sparse EM step operating only on CSR nonzeros.
+
+    E-step complexity: O(nnz) instead of O(n_cells * n_genes).
+    M-step uses serial scatter-add into phi_acc to avoid races.
     """
-    n_cells, n_genes = counts.shape
     n_clusters = phi.shape[0]
+    nnz = len(data)
 
-    # E-step: Calculate expected native counts
-    native_counts = np.zeros((n_cells, n_genes), dtype=np.float64)
+    # E-step: compute nc_data aligned to CSR nonzero positions
+    nc_data = np.zeros(nnz, dtype=np.float64)
 
-    for j in range(n_cells):
+    for j in prange(n_cells):
         cluster_idx = z[j] - 1
         theta_j = theta[j]
+        one_minus_theta = 1.0 - theta_j
+        for idx in range(indptr[j], indptr[j + 1]):
+            g = indices[idx]
+            count = data[idx]
+            p_native = theta_j * phi[cluster_idx, g]
+            p_contam = one_minus_theta * eta[cluster_idx, g]
+            total = p_native + p_contam + pseudocount
+            nc_data[idx] = count * (p_native + pseudocount) / total
 
-        # Calculate posterior probability that each count is native
-        for g in range(n_genes):
-            if counts[j, g] > 0:
-                # P(native) = theta * phi / (theta * phi + (1-theta) * eta)
-                p_native = theta_j * phi[cluster_idx, g]
-                p_contam = (1.0 - theta_j) * eta[cluster_idx, g]
+    # M-step: native row sums (for theta update)
+    native_sums = np.zeros(n_cells, dtype=np.float64)
+    for j in range(n_cells):
+        s = 0.0
+        for idx in range(indptr[j], indptr[j + 1]):
+            s += nc_data[idx]
+        native_sums[j] = s
 
-                # Avoid division by zero
-                total = p_native + p_contam + pseudocount
-                native_counts[j, g] = counts[j, g] * (p_native + pseudocount) / total
+    # Update delta
+    if estimate_delta:
+        proportions = native_sums / (counts_colsums + pseudocount)
+        mean_prop = 0.0
+        for j in range(n_cells):
+            mean_prop += proportions[j]
+        mean_prop /= n_cells
 
-    # M-step: Update parameters
+        var_prop = 0.0
+        for j in range(n_cells):
+            d = proportions[j] - mean_prop
+            var_prop += d * d
+        var_prop /= n_cells
+
+        if var_prop > 0.0 and var_prop < mean_prop * (1.0 - mean_prop):
+            precision = mean_prop * (1.0 - mean_prop) / var_prop - 1.0
+            delta[0] = max(0.1, min(1000.0, mean_prop * precision))
+            delta[1] = max(0.1, min(1000.0, (1.0 - mean_prop) * precision))
 
     # Update theta
-    native_sums = np.sum(native_counts, axis=1)
+    for j in range(n_cells):
+        t = (native_sums[j] + delta[0] - 1.0) / (counts_colsums[j] + delta[0] + delta[1] - 2.0)
+        theta[j] = max(pseudocount, min(1.0 - pseudocount, t))
 
-    if estimate_delta:
-        # Simple moment matching for delta
-        proportions = native_sums / (counts_colsums + pseudocount)
-        mean_prop = np.mean(proportions)
-        var_prop = np.var(proportions)
+    # Update phi: serial scatter-add to avoid race conditions
+    phi_acc = np.zeros((n_clusters, n_genes), dtype=np.float64)
+    for j in range(n_cells):
+        k = z[j] - 1
+        for idx in range(indptr[j], indptr[j + 1]):
+            g = indices[idx]
+            phi_acc[k, g] += nc_data[idx]
 
-        if var_prop > 0 and var_prop < mean_prop * (1 - mean_prop):
-            precision = (mean_prop * (1 - mean_prop) / var_prop - 1)
-            delta[0] = mean_prop * precision
-            delta[1] = (1 - mean_prop) * precision
-            # Bound delta values
-            delta[0] = max(0.1, min(1000.0, delta[0]))
-            delta[1] = max(0.1, min(1000.0, delta[1]))
-
-    # Update theta with beta posterior
-    theta_new = (native_sums + delta[0] - 1) / (counts_colsums + delta[0] + delta[1] - 2)
-    theta[:] = np.maximum(pseudocount, np.minimum(1.0 - pseudocount, theta_new))
-
-    # Update phi (expression distribution for each cluster)
-    phi_new = np.zeros_like(phi)
+    # Normalize phi
     for k in range(n_clusters):
-        mask = (z == k + 1)
-        if np.any(mask):
-            # Sum native counts for this cluster
-            cluster_native = np.sum(native_counts[mask, :], axis=0)
-            total = np.sum(cluster_native) + n_genes * pseudocount
-            phi_new[k, :] = (cluster_native + pseudocount) / total
+        total = pseudocount * n_genes
+        for g in range(n_genes):
+            total += phi_acc[k, g]
+        for g in range(n_genes):
+            phi[k, g] = (phi_acc[k, g] + pseudocount) / total
 
-    phi[:] = phi_new
-
-    # Update eta (contamination distribution) - CRITICAL FIX
+    # Update eta: native expression from OTHER clusters
     if estimate_eta:
-        eta_new = np.zeros_like(eta)
+        # global native sum per gene
+        global_acc = np.zeros(n_genes, dtype=np.float64)
+        for k in range(n_clusters):
+            for g in range(n_genes):
+                global_acc[g] += phi_acc[k, g]
 
         for k in range(n_clusters):
-            # CRITICAL: eta[k] should be based on NATIVE expression from OTHER clusters
-            # Not contamination from other clusters!
-            other_mask = (z != k + 1)
-            if np.any(other_mask):
-                # Sum NATIVE counts from OTHER clusters
-                other_native = np.sum(native_counts[other_mask, :], axis=0)
-                total = np.sum(other_native) + n_genes * pseudocount
-                eta_new[k, :] = (other_native + pseudocount) / total
-            else:
-                # If no other clusters, uniform distribution
-                eta_new[k, :] = 1.0 / n_genes
-
-        eta[:] = eta_new
+            total = pseudocount * n_genes
+            for g in range(n_genes):
+                other_native = global_acc[g] - phi_acc[k, g]
+                total += other_native
+            for g in range(n_genes):
+                other_native = global_acc[g] - phi_acc[k, g]
+                eta[k, g] = (other_native + pseudocount) / total
 
     contamination = 1.0 - theta
     return theta, phi, eta, delta, contamination
@@ -235,31 +257,37 @@ def decontx_em_exact(
 
 @jit(nopython=True, parallel=True, cache=True, fastmath=True)
 def calculate_native_matrix_fast(
-        counts: np.ndarray,
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        data: np.ndarray,
+        n_cells: int,
         theta: np.ndarray,
         phi: np.ndarray,
         eta: np.ndarray,
         z: np.ndarray
 ) -> np.ndarray:
     """
-    Fast calculation of native counts with safe parallelization.
-    """
-    n_cells, n_genes = counts.shape
-    native_counts = np.zeros_like(counts, dtype=np.float64)
+    Sparse native count calculation aligned to CSR nonzeros.
 
-    # Parallelize over cells (independent calculations)
+    Returns nc_data: float64 array of same length as data, giving native
+    count estimates at each CSR position. The caller assembles the sparse
+    matrix using the original indptr/indices.
+
+    Each cell j writes only to its own indptr slice — race-free with prange.
+    """
+    nc_data = np.zeros(len(data), dtype=np.float64)
+
     for j in prange(n_cells):
         cluster = z[j] - 1
         theta_j = theta[j]
+        one_minus_theta = 1.0 - theta_j
+        for idx in range(indptr[j], indptr[j + 1]):
+            g = indices[idx]
+            p_native = theta_j * phi[cluster, g] + 1e-20
+            p_contam = one_minus_theta * eta[cluster, g] + 1e-20
+            nc_data[idx] = data[idx] * p_native / (p_native + p_contam)
 
-        # Vectorized calculation for this cell
-        p_native = theta_j * phi[cluster, :] + 1e-20
-        p_contam = (1.0 - theta_j) * eta[cluster, :] + 1e-20
-        p_total = p_native + p_contam
-
-        native_counts[j, :] = counts[j, :] * (p_native / p_total)
-
-    return native_counts
+    return nc_data
 
 
 @jit(nopython=True)
@@ -309,54 +337,80 @@ def nonzero(X: np.ndarray) -> np.ndarray:
 
 @jit(nopython=True, cache=True)
 def decontx_initialize_exact(
-        counts: np.ndarray,
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        data: np.ndarray,
+        n_cells: int,
+        n_genes: int,
         theta: np.ndarray,
         z: np.ndarray,
         pseudocount: float = 1e-20
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    FIXED: Initialize phi and eta exactly as R does.
-    Critical: eta should be based on expression FROM other clusters.
-    """
-    n_cells, n_genes = counts.shape
-    n_clusters = len(np.unique(z))
+    Initialize phi and eta from CSR nonzeros.
 
+    phi[k, g] = weighted-native expression for cluster k (theta-weighted CSR accumulation)
+    eta[k, g] = weighted-native expression from OTHER clusters (ambient signal source)
+    """
+    n_clusters = 0
+    for j in range(n_cells):
+        if z[j] > n_clusters:
+            n_clusters = z[j]
+
+    phi_acc = np.zeros((n_clusters, n_genes))
+    eta_acc = np.zeros((n_clusters, n_genes))
+
+    # Accumulate theta-weighted native counts per cluster and globally
+    global_acc = np.zeros(n_genes)
+
+    for j in range(n_cells):
+        k = z[j] - 1
+        w = theta[j]
+        for idx in range(indptr[j], indptr[j + 1]):
+            g = indices[idx]
+            wv = data[idx] * w
+            phi_acc[k, g] += wv
+            global_acc[g] += wv
+
+    # eta[k] = global weighted-native minus cluster k's contribution
+    for k in range(n_clusters):
+        for g in range(n_genes):
+            eta_acc[k, g] = global_acc[g] - phi_acc[k, g]
+
+    # Normalize phi and eta
     phi = np.zeros((n_clusters, n_genes))
     eta = np.zeros((n_clusters, n_genes))
 
-    # Weight counts by initial theta
-    weighted_native = counts * theta[:, np.newaxis]
-    weighted_contam = counts * (1.0 - theta[:, np.newaxis])
-
-    # Calculate phi and eta for each cluster
     for k in range(n_clusters):
-        cluster_mask = (z == k + 1)
+        phi_total = pseudocount * n_genes
+        eta_total = pseudocount * n_genes
+        for g in range(n_genes):
+            phi_total += phi_acc[k, g]
+            eta_total += eta_acc[k, g]
 
-        # Phi: native expression for cluster k
-        if np.any(cluster_mask):
-            phi_counts = np.sum(weighted_native[cluster_mask, :], axis=0)
-            phi_total = np.sum(phi_counts) + n_genes * pseudocount
-            phi[k, :] = (phi_counts + pseudocount) / phi_total
+        if phi_total > 0:
+            for g in range(n_genes):
+                phi[k, g] = (phi_acc[k, g] + pseudocount) / phi_total
         else:
-            phi[k, :] = 1.0 / n_genes
+            for g in range(n_genes):
+                phi[k, g] = 1.0 / n_genes
 
-        # Eta: contamination INTO cluster k FROM other clusters
-        # This should be based on NATIVE expression from OTHER clusters
-        other_mask = ~cluster_mask
-        if np.any(other_mask):
-            # Use NATIVE counts from OTHER clusters
-            eta_counts = np.sum(weighted_native[other_mask, :], axis=0)
-            eta_total = np.sum(eta_counts) + n_genes * pseudocount
-            eta[k, :] = (eta_counts + pseudocount) / eta_total
+        if eta_total > 0:
+            for g in range(n_genes):
+                eta[k, g] = (eta_acc[k, g] + pseudocount) / eta_total
         else:
-            eta[k, :] = 1.0 / n_genes
+            for g in range(n_genes):
+                eta[k, g] = 1.0 / n_genes
 
     return phi, eta
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def decontx_log_likelihood_exact(
-        counts: np.ndarray,
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        data: np.ndarray,
+        n_cells: int,
         theta: np.ndarray,
         eta: np.ndarray,
         phi: np.ndarray,
@@ -364,24 +418,19 @@ def decontx_log_likelihood_exact(
         pseudocount: float = 1e-20
 ) -> float:
     """
-    Sequential log-likelihood calculation to avoid compilation issues.
-    Still fast due to vectorization within each cell.
+    O(nnz) log-likelihood iterating only over CSR nonzeros.
     """
-    n_cells, n_genes = counts.shape
     log_likelihood = 0.0
 
     for j in range(n_cells):
         cluster_idx = z[j] - 1
-
-        # Vectorized calculation for all genes in this cell
-        mixture_probs = (theta[j] * phi[cluster_idx, :] +
-                         (1.0 - theta[j]) * eta[cluster_idx, :] +
-                         pseudocount)
-
-        # Only sum where counts > 0
-        mask = counts[j, :] > 0
-        if np.any(mask):
-            log_likelihood += np.sum(counts[j, mask] * np.log(mixture_probs[mask]))
+        theta_j = theta[j]
+        one_minus_theta = 1.0 - theta_j
+        for idx in range(indptr[j], indptr[j + 1]):
+            g = indices[idx]
+            count = data[idx]
+            mixture = theta_j * phi[cluster_idx, g] + one_minus_theta * eta[cluster_idx, g]
+            log_likelihood += count * np.log(mixture + pseudocount)
 
     return log_likelihood
 
