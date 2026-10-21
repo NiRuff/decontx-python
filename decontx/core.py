@@ -165,17 +165,13 @@ def decontx(
 def _validate_inputs(adata: AnnData, cluster_key: str, batch_key: Optional[str]):
     """Validate input parameters."""
 
-    # Check for negative values
-    if adata.X.min() < 0:
-        raise ValueError("Count matrix contains negative values")
+    # Only stored values matter; avoids N x G temporaries for dense input
+    values = adata.X.data if issparse(adata.X) else adata.X
 
-    # Check for missing values
-    if issparse(adata.X):
-        if np.any(np.isnan(adata.X.data)):
-            raise ValueError("Count matrix contains NaN values")
-    else:
-        if np.any(np.isnan(adata.X)):
-            raise ValueError("Count matrix contains NaN values")
+    if values.size and np.isnan(values.sum()):
+        raise ValueError("Count matrix contains NaN values")
+    if values.size and values.min() < 0:
+        raise ValueError("Count matrix contains negative values")
 
     # Check dimensions
     if adata.n_obs < 10:
@@ -197,16 +193,14 @@ def _process_cluster_labels(z: np.ndarray) -> np.ndarray:
 
     # Convert to sequential integers starting from 1 (R compatibility)
     if not np.issubdtype(z.dtype, np.integer):
-        label_map = {label: i + 1 for i, label in enumerate(unique_labels)}
-        z = np.array([label_map[x] for x in z])
+        z = np.unique(z, return_inverse=True)[1].ravel() + 1
     else:
         # Ensure sequential starting from 1
         min_label = np.min(z)
         if min_label <= 0:
             z = z - min_label + 1
         elif min_label > 1:
-            label_map = {label: i + 1 for i, label in enumerate(np.sort(unique_labels))}
-            z = np.array([label_map[x] for x in z])
+            z = np.unique(z, return_inverse=True)[1].ravel() + 1
 
     return z.astype(int)
 

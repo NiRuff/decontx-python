@@ -4,9 +4,8 @@ Complete variational inference following Yang et al. (2020).
 """
 
 import numpy as np
-from scipy import optimize
-from scipy.special import digamma, polygamma, gammaln
-from scipy.stats import beta, dirichlet
+from numba import get_num_threads
+from scipy.stats import beta
 from scipy.sparse import issparse, csr_matrix
 from typing import Tuple, Optional, Dict
 import warnings
@@ -46,19 +45,18 @@ class DecontXModel:
             X = csr_matrix(X)
         if X.format != 'csr':
             X = X.tocsr()
-        X = X.astype(np.float64)
+        X = X.astype(np.float64, copy=False)
 
         z = np.ascontiguousarray(z, dtype=np.int32)
         n_cells, n_genes = X.shape
         n_clusters = len(np.unique(z))
 
         # Pull out CSR arrays for numba
-        indptr = X.indptr.astype(np.int64)
-        indices = X.indices.astype(np.int64)
+        indptr = X.indptr
+        indices = X.indices
         data = np.ascontiguousarray(X.data, dtype=np.float64)
 
         # Initialize theta from Beta distribution
-        from scipy.stats import beta
         theta = beta.rvs(self.delta[0], self.delta[1], size=n_cells, random_state=self.seed)
         theta = np.ascontiguousarray(theta, dtype=np.float64)
 
@@ -79,43 +77,51 @@ class DecontXModel:
         # Row sums from sparse (avoids dense sum)
         counts_colsums = np.asarray(X.sum(axis=1)).ravel().astype(np.float64)
 
+        # Balance cells across chunks by nonzeros for the parallel E-step
+        n_chunks = max(1, min(get_num_threads(), n_cells))
+        targets = np.linspace(0, indptr[-1], n_chunks + 1)
+        chunk_bounds = np.searchsorted(indptr, targets, side='left').astype(np.int64)
+        chunk_bounds[0], chunk_bounds[-1] = 0, n_cells
+        chunk_bounds = np.maximum.accumulate(chunk_bounds)
+
+        # Workspace reused across iterations
+        native_sums = np.empty(n_cells, dtype=np.float64)
+        phi_buf = np.empty((n_chunks, n_clusters, n_genes), dtype=np.float64)
+        phi_acc = np.empty((n_clusters, n_genes), dtype=np.float64)
+        delta = np.ascontiguousarray(self.delta, dtype=np.float64)
+
         # EM algorithm
         log_likelihood_history = []
 
         for iteration in range(self.max_iter):
-            theta_old = theta.copy()
-
-            # EM step — operates on CSR arrays
-            theta, phi, eta, delta_new, contamination = decontx_em_exact(
-                indptr, indices, data, n_cells, n_genes,
+            # EM step — updates theta, phi, eta, delta in place
+            theta_change = decontx_em_exact(
+                indptr, indices, data, n_genes,
                 counts_colsums, theta,
-                estimate_eta=(X_background is None),
-                eta=eta, phi=phi, z=z,
-                estimate_delta=self.estimate_delta,
-                delta=self.delta.copy(),
-                pseudocount=1e-20
+                X_background is None,
+                eta, phi, z,
+                self.estimate_delta,
+                delta,
+                chunk_bounds, native_sums, phi_buf, phi_acc,
+                1e-20
             )
 
-            if self.estimate_delta:
-                self.delta = delta_new
-
-            # Check convergence every iter_loglik iterations
-            if iteration % self.iter_loglik == 0:
+            # Log progress every iter_loglik iterations (likelihood only when verbose)
+            if self.verbose and iteration % self.iter_loglik == 0:
                 log_lik = decontx_log_likelihood_exact(
                     indptr, indices, data, n_cells, theta, eta, phi, z, 1e-20
                 )
                 log_likelihood_history.append(log_lik)
+                print(f"Iter {iteration}: LL={log_lik:.1f}, change={theta_change:.4f}, "
+                      f"mean_contam={(1-theta.mean()):.3f}", flush=True)
 
-                theta_change = np.max(np.abs(theta - theta_old))
-
+            # Convergence check is O(n_cells) and done every iteration
+            if theta_change < self.convergence_threshold:
                 if self.verbose:
-                    print(f"Iter {iteration}: LL={log_lik:.1f}, change={theta_change:.4f}, "
-                          f"mean_contam={(1-theta.mean()):.3f}", flush=True)
+                    print(f"Converged at iteration {iteration}", flush=True)
+                break
 
-                if theta_change < self.convergence_threshold:
-                    if self.verbose:
-                        print(f"Converged at iteration {iteration}", flush=True)
-                    break
+        self.delta = delta
 
         # Final native counts — nc_data aligned to CSR nonzeros
         nc_data = calculate_native_matrix_fast(indptr, indices, data, n_cells, theta, phi, eta, z)
