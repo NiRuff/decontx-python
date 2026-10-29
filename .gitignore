@@ -48,3 +48,4 @@ tmp/
 skills-lock.json
 htmlcov/
 coverage.xml
+.coverage
