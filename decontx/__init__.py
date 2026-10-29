@@ -5,7 +5,7 @@ Python implementation of the DecontX algorithm for estimating and removing
 contamination in individual cells from ambient RNA.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 from .core import (
     decontx,

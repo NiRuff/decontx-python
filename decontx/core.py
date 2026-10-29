@@ -10,6 +10,7 @@ from scipy.sparse import issparse, csr_matrix, vstack
 import warnings
 from datetime import datetime
 
+from . import __version__
 from .model import DecontXModel
 
 
@@ -354,7 +355,7 @@ def _store_metadata(
             'end_time': end_time.isoformat(),
             'duration_seconds': (end_time - start_time).total_seconds()
         },
-        'version': "0.2.0"
+        'version': __version__
     }
 
     adata.uns['decontX'] = metadata

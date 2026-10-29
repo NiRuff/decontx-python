@@ -137,7 +137,11 @@ class DecontXModel:
             shape=(n_cells, n_genes)
         )
 
-        contamination = 1.0 - theta
+        # As in R (decontXEM): report the E-step contamination proportion of the
+        # last iteration, not 1 - theta (which includes the Beta prior)
+        native_prop = np.divide(native_sums, counts_colsums,
+                                out=np.ones_like(native_sums), where=counts_colsums > 0)
+        contamination = 1.0 - native_prop
 
         return {
             'contamination': contamination,

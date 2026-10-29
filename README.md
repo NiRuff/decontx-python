@@ -64,15 +64,12 @@ DecontX models each cell as a mixture of:
 
 ## Validation: R vs Python Implementation
 
-Our Python implementation achieves near-perfect concordance with the original R version:
+Validated against R decontX 1.10.0 (R 4.6.1) on the 10x Genomics 10k human/mouse mixture
+(hgmm 3' v3.1; 9,588 single-species cells, species used as cluster labels, default parameters):
 
-<img width="2250" height="1500" alt="decontx_comparison_real_data" src="https://github.com/user-attachments/assets/fc1358fa-1f54-42d9-953d-d2281d90d2d5" />
-
-**PBMC 3K Dataset Results:**
-- **Correlation: 0.999** between R and Python implementations
-- **Mean Absolute Error: <1%** across all parameter settings
-- **Identical statistical properties** (mean, std, range) 
-- **Per-cluster consistency** maintained across cell types
+- **Per-cell contamination:** mean absolute difference to R < 0.0001, max < 0.001
+- **Ground truth:** estimates correlate with the observed cross-species read fraction
+  (r = 0.998 human, r = 1.000 mouse); R and Python show the same slight underestimation
 
 ## Method Comparison
 
@@ -120,23 +117,10 @@ Results stored in `adata`:
 - `adata.layers['decontX_counts']`: Decontaminated count matrix
 - `adata.uns['decontX']`: Model parameters and metadata
 
-### Utility Functions
-
-```python
-# Get decontaminated counts as array
-clean_counts = decontx.get_decontx_counts(adata)
-
-# Get contamination estimates
-contamination = decontx.get_decontx_contamination(adata)
-
-# Simple simulation for testing
-sim_data = decontx.simulate_contamination(n_cells=1000, n_genes=2000)
-```
-
 ## Performance Notes
 
-- Python implementation is ~2-3x slower than R version
-- Performance acceptable for typical datasets (<50k cells)
+- Sparse, parallel EM (numba); hgmm 10k (9.6k cells, 69k genes): ~1 s with 12 threads
+- Note: R decontX always computes a UMAP, even with given clusters, so end-to-end runtimes are not directly comparable
 - Numba JIT compilation provides significant speedup after first run
 - Memory usage scales linearly with dataset size
 

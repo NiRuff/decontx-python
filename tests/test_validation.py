@@ -69,7 +69,9 @@ def test_regression_against_golden(sim):
     a = _adata(X, z)
     decontx(a, verbose=False)
     diff = np.abs(a.obs["decontX_contamination"].values - np.load(GOLDEN))
-    assert diff.max() < 0.01 and diff.mean() < 0.002
+    # Tight enough to catch the 0.2 -> 0.3 changes (mean 5e-4 and 9e-4), loose enough
+    # for platform/thread rounding that can shift convergence by one iteration.
+    assert diff.max() < 2e-3 and diff.mean() < 2e-4
 
 
 @pytest.mark.skipif(numba.config.NUMBA_NUM_THREADS < 2, reason="needs >= 2 threads")

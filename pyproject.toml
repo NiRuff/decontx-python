@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decontx-python"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python implementation of DecontX for removing ambient RNA contamination from single-cell RNA-seq data"
 readme = "README.md"
 license = "MIT"
