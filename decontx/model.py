@@ -49,7 +49,7 @@ class DecontXModel:
 
         z = np.ascontiguousarray(z, dtype=np.int32)
         n_cells, n_genes = X.shape
-        n_clusters = len(np.unique(z))
+        n_clusters = int(z.max())  # kernels index with z - 1
 
         # Pull out CSR arrays for numba
         indptr = X.indptr
@@ -78,7 +78,8 @@ class DecontXModel:
         counts_colsums = np.asarray(X.sum(axis=1)).ravel().astype(np.float64)
 
         # Balance cells across chunks by nonzeros for the parallel E-step
-        n_chunks = max(1, min(get_num_threads(), n_cells))
+        max_chunks_mem = max(1, int(256e6 // (8 * n_clusters * n_genes)))
+        n_chunks = max(1, min(get_num_threads(), n_cells, max_chunks_mem))
         targets = np.linspace(0, indptr[-1], n_chunks + 1)
         chunk_bounds = np.searchsorted(indptr, targets, side='left').astype(np.int64)
         chunk_bounds[0], chunk_bounds[-1] = 0, n_cells
@@ -106,17 +107,20 @@ class DecontXModel:
                 1e-20
             )
 
-            # Log progress every iter_loglik iterations (likelihood only when verbose)
-            if self.verbose and iteration % self.iter_loglik == 0:
+            # Convergence check is O(n_cells) and done every iteration
+            converged = theta_change < self.convergence_threshold
+
+            # Log-likelihood every iter_loglik iterations and at convergence (as in R)
+            if converged or iteration % self.iter_loglik == 0:
                 log_lik = decontx_log_likelihood_exact(
                     indptr, indices, data, n_cells, theta, eta, phi, z, 1e-20
                 )
                 log_likelihood_history.append(log_lik)
-                print(f"Iter {iteration}: LL={log_lik:.1f}, change={theta_change:.4f}, "
-                      f"mean_contam={(1-theta.mean()):.3f}", flush=True)
+                if self.verbose:
+                    print(f"Iter {iteration}: LL={log_lik:.1f}, change={theta_change:.4f}, "
+                          f"mean_contam={(1-theta.mean()):.3f}", flush=True)
 
-            # Convergence check is O(n_cells) and done every iteration
-            if theta_change < self.convergence_threshold:
+            if converged:
                 if self.verbose:
                     print(f"Converged at iteration {iteration}", flush=True)
                 break

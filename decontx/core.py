@@ -234,7 +234,8 @@ def _process_batches(
         else:
             X_batch = adata.X[batch_mask]
 
-        z_batch = z_labels[batch_mask]
+        # Relabel to 1..K within the batch (as R's .processCellLabels per batch)
+        z_batch = np.unique(z_labels[batch_mask], return_inverse=True)[1].ravel() + 1
 
         # Run decontamination
         result = _run_decontx_single(
