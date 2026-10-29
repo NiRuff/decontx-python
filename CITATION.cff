@@ -1,10 +1,10 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the original DecontX paper and this implementation."
 title: "decontx-python: Python implementation of DecontX"
-  authors:
-    - family-names: Ruffini
-      given-names: Nicolas
-      orcid: "https://orcid.org/0000-0003-3342-6756"
+authors:
+  - family-names: Ruffini
+    given-names: Nicolas
+    orcid: "https://orcid.org/0000-0003-3342-6756"
 version: 0.3.0
 date-released: 2026-10-29
 license: MIT
