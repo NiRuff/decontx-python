@@ -46,3 +46,5 @@ tmp/
 # - GSE artifacts -
 .agents
 skills-lock.json
+htmlcov/
+coverage.xml
