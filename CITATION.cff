@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the original DecontX paper and this implementation."
+title: "decontx-python: Python implementation of DecontX"
+  authors:
+    - family-names: Ruffini
+      given-names: Nicolas
+      orcid: "https://orcid.org/0000-0003-3342-6756"
+version: 0.3.0
+date-released: 2026-10-29
+license: MIT
+repository-code: "https://github.com/NiRuff/decontx-python"
+references:
+  - type: article
+    title: "Decontamination of ambient RNA in single-cell RNA-seq with DecontX"
+    authors:
+      - {family-names: Yang, given-names: Shiyi}
+      - {family-names: Corbett, given-names: Sean E.}
+      - {family-names: Koga, given-names: Yusuke}
+      - {family-names: Wang, given-names: Zhe}
+      - {family-names: Johnson, given-names: W. Evan}
+      - {family-names: Yajima, given-names: Masanao}
+      - {family-names: Campbell, given-names: Joshua D.}
+    journal: "Genome Biology"
+    volume: 21
+    start: 57
+    year: 2020
+    doi: "10.1186/s13059-020-1950-6"

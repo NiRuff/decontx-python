@@ -70,6 +70,10 @@ Validated against R decontX 1.10.0 (R 4.6.1) on the 10x Genomics 10k human/mouse
 - **Per-cell contamination:** mean absolute difference to R < 0.0001, max < 0.001
 - **Ground truth:** estimates correlate with the observed cross-species read fraction
   (r = 0.998 human, r = 1.000 mouse); R and Python show the same slight underestimation
+ 
+![decontx-python vs. R decontX and vs. ground truth on 10x hgmm 10k](https://raw.githubusercontent.com/NiRuff/decontx-python/master/docs/validation_hgmm10k.png)
+
+*Left: per-cell contamination, Python vs. R. Right: Python estimates vs. the fraction of reads from the other species (dashed: identity). With species as cluster labels, DecontX models only cross-species contamination, which is what the x-axis measures.*
 
 ## Method Comparison
 
